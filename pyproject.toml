@@ -1,0 +1,100 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "scopeloop"
+version = "0.1.0"
+description = "Hardware development automation platform for LLM coding agents"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    { name = "Josh Horne" }
+]
+keywords = ["hardware", "embedded", "automation", "mcp", "llm", "oscilloscope", "debugging"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Embedded Systems",
+    "Topic :: Scientific/Engineering :: Electronic Design Automation (EDA)",
+]
+
+dependencies = [
+    # Control Plane
+    "mcp>=1.0.0",
+    "aiofiles>=24.1.0",
+    "pyserial-asyncio>=0.6",
+
+    # Instrument Control
+    "pyvisa>=1.14.0",
+    "pyvisa-py>=0.7.0",
+    "pyserial>=3.5",
+
+    # Data & Measurement
+    "numpy>=1.26.0",
+    "scipy>=1.12.0",
+
+    # Configuration & CLI
+    "pyyaml>=6.0",
+    "typer>=0.12.0",
+    "rich>=13.0.0",
+
+    # API & UI Backend
+    "websockets>=12.0",
+    "fastapi>=0.110.0",
+    "uvicorn>=0.27.0",
+
+    # Utilities
+    "pydantic>=2.6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.3.0",
+    "mypy>=1.8.0",
+]
+sigrok = [
+    "pysigrok>=0.1.0",
+]
+saleae = [
+    "logic2-automation>=1.0.0",
+]
+all-instruments = [
+    "pysigrok>=0.1.0",
+    "logic2-automation>=1.0.0",
+]
+
+[project.scripts]
+scopeloop = "scopeloop.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/joshhorne/scopeloop"
+Repository = "https://github.com/joshhorne/scopeloop"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/scopeloop"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
