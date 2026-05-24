@@ -163,7 +163,7 @@ class SigrokDevice(Instrument):
 
         Args:
             driver: sigrok driver name (e.g., "siglent-sds", "fx2lafw").
-            connection: Connection string (e.g., "tcp-raw/192.168.1.100/5025").
+            connection: Connection string (e.g., "tcp-raw/192.0.2.100/5025").
             timeout: Command timeout in seconds.
         """
         self.driver = driver
@@ -316,7 +316,7 @@ class SigrokOscilloscope(SigrokDevice):
     Usage:
         scope = SigrokOscilloscope(
             driver="siglent-sds",
-            connection="tcp-raw/192.168.1.100/5025"
+            connection="tcp-raw/192.0.2.100/5025"
         )
 
         async with scope:

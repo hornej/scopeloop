@@ -10,7 +10,7 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
 authors = [
-    { name = "Josh Horne" }
+    { name = "ScopeLoop Contributors" }
 ]
 keywords = ["hardware", "embedded", "automation", "mcp", "llm", "oscilloscope", "debugging"]
 classifiers = [
@@ -74,10 +74,6 @@ all-instruments = [
 
 [project.scripts]
 scopeloop = "scopeloop.cli:app"
-
-[project.urls]
-Homepage = "https://github.com/joshhorne/scopeloop"
-Repository = "https://github.com/joshhorne/scopeloop"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/scopeloop"]

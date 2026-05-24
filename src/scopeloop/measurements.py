@@ -342,11 +342,13 @@ class MeasurementEngine:
         in_rise = False
         rise_start = 0
 
-        for i, v in enumerate(samples):
-            if not in_rise and v < low_thresh:
+        for i in range(1, len(samples)):
+            previous = samples[i - 1]
+            current = samples[i]
+            if not in_rise and previous < low_thresh <= current:
                 in_rise = True
                 rise_start = i
-            elif in_rise and v > high_thresh:
+            elif in_rise and current >= high_thresh:
                 rise_time = (i - rise_start) / sample_rate
                 rise_times.append(rise_time)
                 in_rise = False
@@ -396,11 +398,13 @@ class MeasurementEngine:
         in_fall = False
         fall_start = 0
 
-        for i, v in enumerate(samples):
-            if not in_fall and v > high_thresh:
+        for i in range(1, len(samples)):
+            previous = samples[i - 1]
+            current = samples[i]
+            if not in_fall and previous > high_thresh >= current:
                 in_fall = True
                 fall_start = i
-            elif in_fall and v < low_thresh:
+            elif in_fall and current <= low_thresh:
                 fall_time = (i - fall_start) / sample_rate
                 fall_times.append(fall_time)
                 in_fall = False

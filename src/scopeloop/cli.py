@@ -14,6 +14,7 @@ from rich.table import Table
 from scopeloop import __version__
 from scopeloop.config import Config, create_default_config, load_config
 from scopeloop.devices import DeviceManager, DeviceMatch
+from scopeloop.host import collect_host_status, format_bytes
 from scopeloop.safety import GuardrailType, SafetyConfig, SafetyGuardrails
 from scopeloop.session import SessionManager
 
@@ -142,6 +143,55 @@ def status(
         console.print(Panel("\n".join(instruments_info), title="Instruments"))
     else:
         console.print("[dim]No instruments configured.[/dim]")
+
+    if config.modules:
+        modules_table = Table(show_header=True, header_style="bold")
+        modules_table.add_column("Name")
+        modules_table.add_column("Slot")
+        modules_table.add_column("Class")
+        modules_table.add_column("Interface")
+        modules_table.add_column("Capabilities")
+
+        for name, module in config.modules.items():
+            capabilities = ", ".join(
+                capability.name for capability in module.manifest.capabilities[:3]
+            )
+            if len(module.manifest.capabilities) > 3:
+                capabilities = (
+                    f"{capabilities}, +{len(module.manifest.capabilities) - 3} more"
+                )
+            modules_table.add_row(
+                name,
+                module.slot,
+                module.manifest.slot_class,
+                module.manifest.electrical_interface,
+                capabilities or "-",
+            )
+
+        console.print(Panel(modules_table, title="Module Bay Cards"))
+
+    if config.fixtures:
+        fixtures_table = Table(show_header=True, header_style="bold")
+        fixtures_table.add_column("Name")
+        fixtures_table.add_column("Type")
+        fixtures_table.add_column("Connection")
+        fixtures_table.add_column("Capabilities")
+
+        for name, fixture in config.fixtures.items():
+            connection = fixture.connection.type
+            if fixture.connection.controller:
+                connection = f"{connection} via {fixture.connection.controller}"
+            if fixture.connection.path:
+                connection = f"{connection} ({fixture.connection.path})"
+
+            capabilities = ", ".join(
+                capability.name for capability in fixture.capabilities[:3]
+            )
+            if len(fixture.capabilities) > 3:
+                capabilities = f"{capabilities}, +{len(fixture.capabilities) - 3} more"
+            fixtures_table.add_row(name, fixture.type, connection, capabilities or "-")
+
+        console.print(Panel(fixtures_table, title="Fixtures"))
 
 
 # ============================================================================
@@ -399,6 +449,78 @@ def safety_reset(
     else:
         safety.reset()
         console.print("[green]Reset all guardrails[/green]")
+
+
+# ============================================================================
+# Host command
+# ============================================================================
+
+
+host_app = typer.Typer(help="Inspect the local instrument host.")
+app.add_typer(host_app, name="host")
+
+
+@host_app.command("status")
+def host_status(
+    config_path: Annotated[
+        Path | None,
+        typer.Option("--config", "-c", help="Path to scopeloop.yaml."),
+    ] = None,
+    data_dir: Annotated[
+        Path | None,
+        typer.Option("--data-dir", help="Override runtime.data_dir for disk-space checks."),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print machine-readable JSON."),
+    ] = False,
+) -> None:
+    """Show whether this machine is ready to act as the instrument host."""
+    config: Config | None
+    try:
+        config = load_config(config_path)
+    except FileNotFoundError:
+        config = None
+
+    status = collect_host_status(config=config, data_dir=data_dir)
+
+    if json_output:
+        import json
+
+        console.print_json(json.dumps(status.to_dict(), indent=2))
+        return
+
+    runtime = Table.grid(padding=(0, 2))
+    runtime.add_row("[bold]Mode:[/bold]", status.mode)
+    runtime.add_row("[bold]Host:[/bold]", status.host or "this machine")
+    runtime.add_row("[bold]API Port:[/bold]", str(status.port))
+    runtime.add_row("[bold]Platform:[/bold]", f"{status.platform} {status.machine}")
+    runtime.add_row("[bold]Python:[/bold]", status.python)
+    console.print(Panel(runtime, title="Instrument Host"))
+
+    checks_table = Table(show_header=True, header_style="bold")
+    checks_table.add_column("Dependency")
+    checks_table.add_column("Kind")
+    checks_table.add_column("Status")
+    checks_table.add_column("Detail")
+
+    for check in status.checks:
+        state = "[green]ok[/green]" if check.available else "[yellow]missing[/yellow]"
+        detail = check.detail
+        if check.version:
+            detail = f"{detail} ({check.version})"
+        checks_table.add_row(check.name, check.kind, state, detail)
+
+    console.print(Panel(checks_table, title="Local Capabilities"))
+
+    storage = status.storage
+    storage_info = Table.grid(padding=(0, 2))
+    storage_info.add_row("[bold]Capture Dir:[/bold]", storage.path)
+    storage_info.add_row("[bold]Exists:[/bold]", "yes" if storage.exists else "no")
+    storage_info.add_row("[bold]Checked Path:[/bold]", storage.checked_path)
+    storage_info.add_row("[bold]Free:[/bold]", format_bytes(storage.free_bytes))
+    storage_info.add_row("[bold]Total:[/bold]", format_bytes(storage.total_bytes))
+    console.print(Panel(storage_info, title="Storage"))
 
 
 # ============================================================================

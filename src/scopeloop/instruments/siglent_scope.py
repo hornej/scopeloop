@@ -99,7 +99,7 @@ class SiglentSDS1000X(Instrument):
     Supports SDS1104X-E, SDS1204X-E, and similar models.
 
     Usage:
-        scope = SiglentSDS1000X("192.168.1.100")
+        scope = SiglentSDS1000X("192.0.2.100")
 
         async with scope:
             # Get info
