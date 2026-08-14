@@ -561,8 +561,8 @@ instruments:
   #     boot:
   #       digital_channels: [0, 1]
   #       analog_channels: [0]
-  #       digital_sample_rate: 10000000
-  #       analog_sample_rate: 1000000
+  #       digital_sample_rate: 6250000
+  #       analog_sample_rate: 781250
   #       logic_family_volts: 3.3
   #       trigger: {{channel: 0, edge: rising, pre_trigger_seconds: 0.25,
   #                 post_trigger_seconds: 0.75, timeout_seconds: 30}}

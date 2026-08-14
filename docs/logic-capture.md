@@ -51,8 +51,8 @@ instruments:
         description: Power and reset capture with boot UART
         digital_channels: [2, 3]
         analog_channels: [2]
-        digital_sample_rate: 10000000
-        analog_sample_rate: 1000000
+        digital_sample_rate: 6250000
+        analog_sample_rate: 781250
         logic_family_volts: 3.3
         trigger:
           channel: 2
@@ -92,6 +92,12 @@ not prove a valid ESP32 logic level.
 The metadata object is deliberately open-ended. Require the fields that make a
 run reproducible, then use any additional key/value fields needed to describe
 the DUT, fixture, probe state, temporary modifications, or custody.
+
+Sample-rate combinations depend on the Logic model and the enabled digital and
+analog channel counts. The two-digital/one-analog Logic Pro 16 example above
+uses a pair accepted by Logic 2.4.46. ScopeLoop passes the requested pair to
+Logic 2 and reports the device's advertised alternatives if the request is not
+supported; it does not silently substitute different rates.
 
 ## Capture and decode
 
