@@ -42,8 +42,8 @@ def test_config_runtime_defaults():
 def test_windows_app_candidates(monkeypatch):
     monkeypatch.setattr(host_module.platform, "system", lambda: "Windows")
 
-    saleae_paths = [str(path) for path in host_module._saleae_app_candidates()]
-    pico_paths = [str(path) for path in host_module._picoscope_app_candidates()]
+    saleae_paths = [path.as_posix() for path in host_module._saleae_app_candidates()]
+    pico_paths = [path.as_posix() for path in host_module._picoscope_app_candidates()]
 
     assert "C:/Program Files/Logic/Logic.exe" in saleae_paths
     assert "C:/Program Files/Pico Technology/PicoScope 7 T&M Stable/PicoScope.exe" in pico_paths

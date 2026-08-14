@@ -8,9 +8,8 @@ from __future__ import annotations
 
 import json
 import logging
-import time
 import uuid
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -39,6 +38,13 @@ class WaveformMetadata:
     vmin: float | None = None
     vrms: float | None = None
     frequency: float | None = None
+    frequency_status: str = "not_requested"
+    frequency_details: dict[str, Any] = field(default_factory=dict)
+
+    # Signal-aware interpretation. Frequency is never inferred for an unknown signal.
+    signal_type: str = "unknown"
+    requested_measurements: list[str] = field(default_factory=list)
+    electrical_limits: dict[str, float] = field(default_factory=dict)
 
     # Instrument settings at capture time
     timebase: float | None = None
@@ -285,9 +291,7 @@ class WaveformStore:
         downsample_factor = metadata.record_length / len(samples)
         effective_dt = dt * downsample_factor
 
-        time_array = (
-            np.arange(len(samples)) * effective_dt + metadata.time_offset
-        ).tolist()
+        time_array = (np.arange(len(samples)) * effective_dt + metadata.time_offset).tolist()
 
         return {
             "capture_id": capture_id,
@@ -306,6 +310,8 @@ class WaveformStore:
                 "vmin": metadata.vmin,
                 "vrms": metadata.vrms,
                 "frequency": metadata.frequency,
+                "frequency_status": metadata.frequency_status,
+                "frequency_details": metadata.frequency_details,
             },
         }
 
@@ -334,14 +340,39 @@ class WaveformStore:
         metadata.vmin = float(np.min(samples))
         metadata.vrms = float(np.sqrt(np.mean(samples**2)))
 
-        # Compute frequency if we have enough samples
-        if len(samples) > 100 and metadata.sample_rate > 0:
+        # Frequency requires both an explicit signal classification and request.
+        frequency_types = {"periodic", "clock", "logic", "uart"}
+        frequency_requested = "frequency" in metadata.requested_measurements
+        if frequency_requested and metadata.signal_type not in frequency_types:
+            metadata.frequency_status = "unsupported_signal_type"
+            metadata.frequency_details = {
+                "reason": "Frequency requires a periodic, clock, logic, or UART signal type"
+            }
+        elif frequency_requested and (len(samples) <= 100 or metadata.sample_rate <= 0):
+            metadata.frequency_status = "insufficient_data"
+            metadata.frequency_details = {
+                "reason": "Frequency requires more than 100 samples and a positive sample rate"
+            }
+        elif frequency_requested:
             try:
                 from scopeloop.measurements import MeasurementEngine
 
                 engine = MeasurementEngine()
-                freq_result = engine.frequency(samples, metadata.sample_rate)
-                if freq_result.confidence > 0.5:
+                signal_type = (
+                    metadata.signal_type
+                    if metadata.signal_type in {"clock", "logic", "uart"}
+                    else "periodic"
+                )
+                freq_result = engine.frequency(
+                    samples,
+                    metadata.sample_rate,
+                    signal_type=signal_type,
+                    logic_low_max_v=metadata.electrical_limits.get("input_low_max_v"),
+                    logic_high_min_v=metadata.electrical_limits.get("input_high_min_v"),
+                )
+                metadata.frequency_status = freq_result.status
+                metadata.frequency_details = freq_result.details
+                if freq_result.status == "valid":
                     metadata.frequency = freq_result.value
             except Exception as e:
                 logger.debug(f"Could not compute frequency: {e}")

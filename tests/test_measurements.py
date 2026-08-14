@@ -59,6 +59,49 @@ class TestFrequencyMeasurement:
 
         assert 990 < result.value < 1010
 
+    def test_midrail_noise_is_not_a_valid_logic_frequency(self, engine):
+        sample_rate = 100_000
+        time = np.arange(2000) / sample_rate
+        samples = 1.65 + 0.1 * np.sin(2 * np.pi * 2500 * time)
+
+        result = engine.frequency(
+            samples,
+            sample_rate,
+            signal_type="clock",
+            logic_low_max_v=0.825,
+            logic_high_min_v=2.475,
+        )
+
+        assert result.value is None
+        assert result.status == "indeterminate_logic_levels"
+        assert "valid low and high" in result.details["reason"]
+
+    def test_valid_3v3_clock_frequency(self, engine):
+        sample_rate = 100_000
+        time = np.arange(2000) / sample_rate
+        samples = np.where(np.sin(2 * np.pi * 1000 * time) >= 0, 3.3, 0.0)
+
+        result = engine.frequency(
+            samples,
+            sample_rate,
+            signal_type="clock",
+            logic_low_max_v=0.825,
+            logic_high_min_v=2.475,
+        )
+
+        assert result.status == "valid"
+        assert 990 < result.value < 1010
+
+    def test_insufficient_amplitude_is_explicit(self, engine):
+        sample_rate = 100_000
+        time = np.arange(2000) / sample_rate
+        samples = 1.0 + 0.005 * np.sin(2 * np.pi * 1000 * time)
+
+        result = engine.frequency(samples, sample_rate)
+
+        assert result.value is None
+        assert result.status == "insufficient_amplitude"
+
 
 class TestAmplitudeMeasurements:
     def test_amplitude(self, engine, sine_wave):

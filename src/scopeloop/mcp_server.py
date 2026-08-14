@@ -16,15 +16,18 @@ from typing import Any
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import (
-    CallToolResult,
-    TextContent,
-    Tool,
-)
+from mcp.types import TextContent, Tool
 
-from scopeloop.config import Config, load_config, create_default_config
+from scopeloop.comparison import compare_bundles
+from scopeloop.config import (
+    Config,
+    LogicUartAnalyzerConfig,
+    create_default_config,
+    load_config,
+)
 from scopeloop.devices import DeviceManager, DeviceMatch
-from scopeloop.resources import ResourceManager, ClientPriority, LockMode, generate_client_id
+from scopeloop.logic import LogicCaptureService
+from scopeloop.resources import ResourceManager, generate_client_id
 from scopeloop.safety import SafetyConfig, SafetyGuardrails
 from scopeloop.session import SessionManager
 
@@ -39,6 +42,7 @@ _resource_manager: ResourceManager | None = None
 _device_manager: DeviceManager | None = None
 _session_manager: SessionManager | None = None
 _safety: SafetyGuardrails | None = None
+_logic_service: LogicCaptureService | None = None
 _client_id: str = generate_client_id("mcp")
 
 
@@ -68,6 +72,17 @@ def _get_safety() -> SafetyGuardrails:
     return _safety
 
 
+def _get_logic_service() -> LogicCaptureService:
+    """Get or lazily initialize the persistent MCP logic workflow."""
+    global _logic_service
+    if _logic_service is None:
+        config = _get_config()
+        if not config or not config.instruments.logic_analyzer:
+            raise RuntimeError("No logic analyzer configured in scopeloop.yaml")
+        _logic_service = LogicCaptureService(config.instruments.logic_analyzer)
+    return _logic_service
+
+
 # ============================================================================
 # Tool Definitions
 # ============================================================================
@@ -75,7 +90,10 @@ def _get_safety() -> SafetyGuardrails:
 TOOLS = [
     Tool(
         name="scopeloop_status",
-        description="Get the current status of ScopeLoop including project info, connected devices, and instrument status.",
+        description=(
+            "Get the current status of ScopeLoop including project info, connected "
+            "devices, and instrument status."
+        ),
         inputSchema={
             "type": "object",
             "properties": {},
@@ -99,7 +117,9 @@ TOOLS = [
                 },
                 "path": {
                     "type": "string",
-                    "description": "Path where to create scopeloop.yaml (default: current directory)",
+                    "description": (
+                        "Path where to create scopeloop.yaml (default: current directory)"
+                    ),
                 },
             },
             "required": ["project_name"],
@@ -138,7 +158,9 @@ TOOLS = [
     ),
     Tool(
         name="scopeloop_build",
-        description="Build the firmware project. Uses the build system configured in scopeloop.yaml.",
+        description=(
+            "Build the firmware project using the build system configured in scopeloop.yaml."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
@@ -278,7 +300,10 @@ TOOLS = [
                 },
                 "measurement": {
                     "type": "string",
-                    "description": "Measurement type: frequency, period, amplitude, vpp, vmax, vmin, vrms, rise_time, fall_time, duty_cycle",
+                    "description": (
+                        "Measurement type: frequency, period, amplitude, vpp, vmax, "
+                        "vmin, vrms, rise_time, fall_time, duty_cycle"
+                    ),
                 },
             },
             "required": ["channel", "measurement"],
@@ -321,22 +346,22 @@ TOOLS = [
     ),
     Tool(
         name="scopeloop_logic_capture",
-        description="Capture digital signals from the logic analyzer.",
+        description="Run a configured logic capture recipe and save an evidence bundle.",
         inputSchema={
             "type": "object",
             "properties": {
-                "duration_ms": {
-                    "type": "number",
-                    "description": "Capture duration in milliseconds",
-                    "default": 100,
+                "recipe": {
+                    "type": "string",
+                    "description": "Capture recipe name from scopeloop.yaml",
                 },
-                "channels": {
-                    "type": "array",
-                    "items": {"type": "integer"},
-                    "description": "Channels to capture (uses config if not specified)",
+                "metadata": {
+                    "type": "object",
+                    "description": "Arbitrary DUT and fixture run metadata",
+                    "additionalProperties": True,
                 },
+                "output_root": {"type": "string"},
             },
-            "required": [],
+            "required": ["recipe", "metadata"],
         },
     ),
     Tool(
@@ -347,10 +372,57 @@ TOOLS = [
             "properties": {
                 "protocol": {
                     "type": "string",
-                    "description": "Protocol to decode: SPI, I2C, UART",
+                    "description": "Protocol to decode (UART in this increment)",
                 },
+                "capture_id": {"type": "string"},
+                "channel": {"type": "integer"},
+                "baud_rate": {"type": "integer", "default": 115200},
+                "name": {"type": "string", "default": "uart"},
+                "output": {"type": "string"},
             },
-            "required": ["protocol"],
+            "required": ["protocol", "capture_id", "channel", "output"],
+        },
+    ),
+    Tool(
+        name="scopeloop_logic_save",
+        description="Save an active MCP capture to a .sal path.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "capture_id": {"type": "string"},
+                "output": {"type": "string"},
+            },
+            "required": ["capture_id", "output"],
+        },
+    ),
+    Tool(
+        name="scopeloop_logic_export",
+        description="Export raw CSV files from an active MCP capture.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "capture_id": {"type": "string"},
+                "output_dir": {"type": "string"},
+                "digital_channels": {"type": "array", "items": {"type": "integer"}},
+                "analog_channels": {"type": "array", "items": {"type": "integer"}},
+            },
+            "required": ["capture_id", "output_dir"],
+        },
+    ),
+    Tool(
+        name="scopeloop_logic_compare",
+        description="Edge-align and compare known-good and DUT evidence bundles.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "reference_bundle": {"type": "string"},
+                "dut_bundle": {"type": "string"},
+                "align_channel": {"type": "integer"},
+                "edge": {"type": "string", "enum": ["rising", "falling"]},
+                "threshold_v": {"type": "number"},
+                "signals": {"type": "array", "items": {"type": "integer"}},
+            },
+            "required": ["reference_bundle", "dut_bundle", "align_channel"],
         },
     ),
     Tool(
@@ -384,7 +456,9 @@ TOOLS = [
     ),
     Tool(
         name="scopeloop_safety_status",
-        description="Get the status of safety guardrails (boot loop detection, build failures, etc.).",
+        description=(
+            "Get the status of safety guardrails (boot loop detection, build failures, etc.)."
+        ),
         inputSchema={
             "type": "object",
             "properties": {},
@@ -399,7 +473,10 @@ TOOLS = [
             "properties": {
                 "guardrail": {
                     "type": "string",
-                    "description": "Specific guardrail to reset: boot_loop, build_failure, flash_failure (resets all if not specified)",
+                    "description": (
+                        "Specific guardrail to reset: boot_loop, build_failure, "
+                        "flash_failure (resets all if not specified)"
+                    ),
                 },
             },
             "required": [],
@@ -407,7 +484,9 @@ TOOLS = [
     ),
     Tool(
         name="scopeloop_user_action",
-        description="Request a physical action from the user (e.g., connect a probe, press a button).",
+        description=(
+            "Request a physical action from the user (e.g., connect a probe, press a button)."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
@@ -475,10 +554,17 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
     except Exception as e:
         logger.exception(f"Error handling tool {name}")
-        return [TextContent(type="text", text=json.dumps({
-            "error": str(e),
-            "tool": name,
-        }))]
+        return [
+            TextContent(
+                type="text",
+                text=json.dumps(
+                    {
+                        "error": str(e),
+                        "tool": name,
+                    }
+                ),
+            )
+        ]
 
 
 async def _handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -531,6 +617,12 @@ async def _handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return await _handle_logic_capture(args)
     elif name == "scopeloop_logic_decode":
         return await _handle_logic_decode(args)
+    elif name == "scopeloop_logic_save":
+        return await _handle_logic_save(args)
+    elif name == "scopeloop_logic_export":
+        return await _handle_logic_export(args)
+    elif name == "scopeloop_logic_compare":
+        return await _handle_logic_compare(args)
 
     # Test tools
     elif name == "scopeloop_test_run":
@@ -582,17 +674,21 @@ async def _handle_status() -> dict[str, Any]:
         # Device status
         device_manager = _get_device_manager()
         devices = []
-        for name, device_config in config.devices.items():
-            device = await device_manager.find_device(DeviceMatch(
-                vid=device_config.match.vid,
-                pid=device_config.match.pid,
-                serial=device_config.match.serial,
-            ))
-            devices.append({
-                "alias": device_config.alias,
-                "connected": device is not None,
-                "port": device.port if device else None,
-            })
+        for _name, device_config in config.devices.items():
+            device = await device_manager.find_device(
+                DeviceMatch(
+                    vid=device_config.match.vid,
+                    pid=device_config.match.pid,
+                    serial=device_config.match.serial,
+                )
+            )
+            devices.append(
+                {
+                    "alias": device_config.alias,
+                    "connected": device is not None,
+                    "port": device.port if device else None,
+                }
+            )
         result["devices"] = devices
 
         # Instrument status
@@ -621,7 +717,7 @@ async def _handle_status() -> dict[str, Any]:
 
 async def _handle_init(args: dict[str, Any]) -> dict[str, Any]:
     """Handle scopeloop_init tool."""
-    global _config
+    global _config, _logic_service
 
     project_name = args["project_name"]
     mcu = args.get("mcu", "esp32")
@@ -631,6 +727,7 @@ async def _handle_init(args: dict[str, Any]) -> dict[str, Any]:
 
     # Reload config
     _config = load_config(config_path)
+    _logic_service = None
 
     return {
         "success": True,
@@ -662,11 +759,13 @@ async def _handle_devices_list() -> dict[str, Any]:
 async def _handle_device_find(args: dict[str, Any]) -> dict[str, Any]:
     """Handle scopeloop_device_find tool."""
     device_manager = _get_device_manager()
-    device = await device_manager.find_device(DeviceMatch(
-        vid=args.get("vid"),
-        pid=args.get("pid"),
-        serial=args.get("serial"),
-    ))
+    device = await device_manager.find_device(
+        DeviceMatch(
+            vid=args.get("vid"),
+            pid=args.get("pid"),
+            serial=args.get("serial"),
+        )
+    )
 
     if device:
         return {
@@ -822,35 +921,72 @@ async def _handle_scope_configure(args: dict[str, Any]) -> dict[str, Any]:
 
 async def _handle_logic_connect() -> dict[str, Any]:
     """Handle scopeloop_logic_connect tool."""
-    config = _get_config()
-    if not config or not config.instruments.logic_analyzer:
-        return {"error": "No logic analyzer configured in scopeloop.yaml"}
-
-    # TODO: Implement logic analyzer connection
-    return {
-        "status": "not_implemented",
-        "message": "Logic analyzer integration not yet implemented",
-        "type": config.instruments.logic_analyzer.type,
-    }
+    return await _get_logic_service().connect()
 
 
 async def _handle_logic_capture(args: dict[str, Any]) -> dict[str, Any]:
     """Handle scopeloop_logic_capture tool."""
-    # TODO: Implement logic capture
-    return {
-        "status": "not_implemented",
-        "message": "Logic analyzer integration not yet implemented",
-    }
+    config = _get_config()
+    if config is None:
+        return {"error": "No scopeloop.yaml found"}
+    output_root = Path(
+        args.get("output_root") or (Path(config.runtime.data_dir).expanduser() / "captures")
+    )
+    bundle = await _get_logic_service().capture_evidence(
+        args["recipe"],
+        args.get("metadata", {}),
+        output_root,
+    )
+    return bundle.to_dict()
 
 
 async def _handle_logic_decode(args: dict[str, Any]) -> dict[str, Any]:
     """Handle scopeloop_logic_decode tool."""
-    # TODO: Implement protocol decode
-    return {
-        "status": "not_implemented",
-        "message": "Logic analyzer integration not yet implemented",
-        "protocol": args.get("protocol"),
-    }
+    if args["protocol"].lower() != "uart":
+        return {
+            "error": "This increment supports UART decode; use a configured recipe for UART",
+            "protocol": args["protocol"],
+        }
+    uart = LogicUartAnalyzerConfig(
+        name=args.get("name", "uart"),
+        channel=args["channel"],
+        baud_rate=args.get("baud_rate", 115200),
+    )
+    path = await _get_logic_service().decode_uart(
+        args["capture_id"],
+        uart,
+        Path(args["output"]),
+    )
+    return {"capture_id": args["capture_id"], "decoded_csv": str(path)}
+
+
+async def _handle_logic_save(args: dict[str, Any]) -> dict[str, Any]:
+    """Handle scopeloop_logic_save tool."""
+    path = await _get_logic_service().save_capture(args["capture_id"], Path(args["output"]))
+    return {"capture_id": args["capture_id"], "saved_capture": str(path)}
+
+
+async def _handle_logic_export(args: dict[str, Any]) -> dict[str, Any]:
+    """Handle scopeloop_logic_export tool."""
+    paths = await _get_logic_service().export_capture(
+        args["capture_id"],
+        Path(args["output_dir"]),
+        args.get("digital_channels"),
+        args.get("analog_channels"),
+    )
+    return {"capture_id": args["capture_id"], "raw_csv": [str(path) for path in paths]}
+
+
+async def _handle_logic_compare(args: dict[str, Any]) -> dict[str, Any]:
+    """Handle scopeloop_logic_compare tool."""
+    return compare_bundles(
+        Path(args["reference_bundle"]),
+        Path(args["dut_bundle"]),
+        args["align_channel"],
+        args.get("edge", "rising"),
+        args.get("threshold_v"),
+        args.get("signals"),
+    )
 
 
 async def _handle_test_run(args: dict[str, Any]) -> dict[str, Any]:
@@ -941,6 +1077,7 @@ async def _handle_session_start(args: dict[str, Any]) -> dict[str, Any]:
         # Read config file content for snapshot
         try:
             from scopeloop.config import find_config_file
+
             config_path = find_config_file()
             config_content = config_path.read_text()
         except Exception:
@@ -984,6 +1121,7 @@ async def _handle_session_end(args: dict[str, Any]) -> dict[str, Any]:
 async def initialize() -> None:
     """Initialize server state."""
     global _config, _resource_manager, _device_manager, _session_manager, _safety
+    global _logic_service
 
     logger.info("Initializing ScopeLoop MCP server...")
 
@@ -999,16 +1137,19 @@ async def initialize() -> None:
     _resource_manager = ResourceManager()
     _device_manager = DeviceManager()
     _session_manager = SessionManager(Path("./sessions"))
+    _logic_service = None
 
     # Initialize safety with config or defaults
     safety_config = _config.safety if _config else SafetyConfig()
-    _safety = SafetyGuardrails(SafetyConfig(
-        max_flash_attempts=safety_config.max_flash_attempts,
-        flash_window_seconds=safety_config.flash_window_seconds,
-        boot_success_marker=safety_config.boot_success_marker,
-        boot_timeout_seconds=safety_config.boot_timeout_seconds,
-        max_consecutive_build_failures=safety_config.max_consecutive_build_failures,
-    ))
+    _safety = SafetyGuardrails(
+        SafetyConfig(
+            max_flash_attempts=safety_config.max_flash_attempts,
+            flash_window_seconds=safety_config.flash_window_seconds,
+            boot_success_marker=safety_config.boot_success_marker,
+            boot_timeout_seconds=safety_config.boot_timeout_seconds,
+            max_consecutive_build_failures=safety_config.max_consecutive_build_failures,
+        )
+    )
 
     logger.info("ScopeLoop MCP server initialized")
 

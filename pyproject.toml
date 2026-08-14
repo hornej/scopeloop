@@ -26,7 +26,7 @@ classifiers = [
 
 dependencies = [
     # Control Plane
-    "mcp>=1.0.0",
+    "mcp>=1.0.0,<2",
     "aiofiles>=24.1.0",
     "pyserial-asyncio>=0.6",
 

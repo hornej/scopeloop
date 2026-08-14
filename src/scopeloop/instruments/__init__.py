@@ -23,6 +23,7 @@ except ImportError:
 
 # Saleae Logic 2 driver (requires logic2-automation)
 try:
+    from scopeloop.instruments.saleae import SALEAE_AVAILABLE as SALEAE_DRIVER_AVAILABLE
     from scopeloop.instruments.saleae import (
         SaleaeLogicAnalyzer,
         i2c_analyzer_settings,
@@ -30,7 +31,7 @@ try:
         uart_analyzer_settings,
     )
 
-    SALEAE_AVAILABLE = True
+    SALEAE_AVAILABLE = SALEAE_DRIVER_AVAILABLE
 except ImportError:
     SALEAE_AVAILABLE = False
     SaleaeLogicAnalyzer = None  # type: ignore
@@ -38,11 +39,11 @@ except ImportError:
     i2c_analyzer_settings = None  # type: ignore
     uart_analyzer_settings = None  # type: ignore
 
-# Legacy Siglent driver (direct SCPI)
-from scopeloop.instruments.siglent_scope import SiglentSDS1000X
-
 # Serial monitor
 from scopeloop.instruments.serial_monitor import SerialMonitor, list_serial_ports
+
+# Legacy Siglent driver (direct SCPI)
+from scopeloop.instruments.siglent_scope import SiglentSDS1000X
 
 __all__ = [
     # Base classes

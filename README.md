@@ -145,6 +145,29 @@ wait for the status LED, capture thermal image, and verify recovery."
 See [docs/hardware-spec.md](docs/hardware-spec.md) for the carrier board and
 fixture expansion hardware direction.
 
+## Reproducible logic evidence
+
+Saleae captures can be driven from named recipes and saved as automatic,
+hashed evidence bundles:
+
+```bash
+scopeloop logic connect --config scopeloop.yaml
+scopeloop logic capture --recipe boot --metadata serial=unit-001 \
+  --metadata board_revision=A --output-root ./captures
+scopeloop logic compare --reference ./captures/known-good \
+  --dut ./captures/dut --align-channel 0 --edge rising
+```
+
+Recipes define channels and sidecar names, digital/analog sample rates, the
+Saleae logic-family setting, pre/post-trigger windows and timeout, UART
+decoders, required arbitrary run metadata, and optional comparison defaults.
+The original `.sal` remains untouched; the official API does not support native
+channel-label mutation, so `channel-map.json` is authoritative.
+
+See [docs/logic-capture.md](docs/logic-capture.md) for the schema, bundle
+contents, electrical interpretation, trigger semantics, API limitations, and
+known-good-versus-DUT workflow.
+
 ## Architecture
 
 ```
