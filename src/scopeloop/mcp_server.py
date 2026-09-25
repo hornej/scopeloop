@@ -1225,8 +1225,12 @@ async def main() -> None:
 
     await initialize()
 
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, server.create_initialization_options())
+    try:
+        async with stdio_server() as (read_stream, write_stream):
+            await server.run(read_stream, write_stream, server.create_initialization_options())
+    finally:
+        if _logic_service:
+            await _logic_service.disconnect(close_captures=True)
 
 
 if __name__ == "__main__":

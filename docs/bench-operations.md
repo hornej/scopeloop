@@ -25,6 +25,8 @@ VID/PID is shared. Ambiguous matching fails instead of choosing the first port.
 application is responding. A Logic connection that fails while USB enumeration
 succeeds is a different layer from a missing USB device.
 
+`scopeloop usb-diagnostics` reads Linux USB sysfs or Windows PnP inventory and
+reports descriptor/problem states separately from application reachability.
 Inspect OS USB inventory and kernel/PnP errors for non-serial devices and descriptor
 failures (`lsusb`, `/sys/bus/usb/devices`, journal, or Windows PnP status). An absent
 serial match alone does not prove physical disconnection. Record tool exit status

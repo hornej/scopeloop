@@ -205,3 +205,53 @@ def test_load_step_windows_and_observation_limit():
     recipe.after_window = (0.1, 0.2)
     with pytest.raises(ValueError, match="outside"):
         waveform_metrics(wave, recipe)
+
+
+def test_usb_descriptor_failure_is_not_absence(monkeypatch, tmp_path):
+    from scopeloop import usb
+
+    monkeypatch.setattr(usb.platform, "system", lambda: "Linux")
+    healthy = tmp_path / "1-2"
+    broken = tmp_path / "1-3"
+    healthy.mkdir()
+    broken.mkdir()
+    (healthy / "idVendor").write_text("239a")
+    (healthy / "idProduct").write_text("8026")
+    (healthy / "serial").write_text("stable-serial")
+    result = usb.inventory(tmp_path)
+    assert result["status"] == "complete"
+    assert result["devices"][0]["serial"] == "stable-serial"
+    assert result["devices"][1]["state"] == "enumeration_failed"
+    assert usb.inventory(tmp_path / "missing")["status"] == "enumeration_failed"
+
+
+async def test_cancelled_saleae_wait_settles_before_return(monkeypatch):
+    import threading
+    import time
+
+    from scopeloop.instruments import saleae
+
+    started, stopped, settled = threading.Event(), threading.Event(), threading.Event()
+
+    class Stub:
+        def WaitCapture(self, request, timeout):  # noqa: N802
+            started.set()
+            assert stopped.wait(2)
+            time.sleep(0.03)
+            settled.set()
+
+    class Capture:
+        capture_id = 1
+        manager = SimpleNamespace(stub=Stub())
+
+        def stop(self):
+            stopped.set()
+
+    analyzer = object.__new__(saleae.SaleaeLogicAnalyzer)
+    task = asyncio.create_task(analyzer._wait_for_capture(Capture(), 2, None, "waiting"))
+    while not started.is_set():
+        await asyncio.sleep(0.001)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert stopped.is_set() and settled.is_set()

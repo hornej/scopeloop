@@ -209,3 +209,9 @@ version-sensitive. Mismatched/missing labels or a failed reopen make the bundle
 fail, with the original still available. Digital/analog views of one physical
 channel must have the same name. Without the option, the untouched SAL is not
 claimed to be labeled. Sidecar entries may be simple names or objects with `name`.
+
+Capture waits use their recipe deadline. Other Logic RPCs use a 60-second gRPC
+service-config deadline. Cancellation stops only the owned capture and waits for
+its worker to settle before releasing ownership. Logic app version is recorded
+separately; device firmware is unavailable through this API, not inferred from the
+app version. See [gRPC service configuration](https://grpc.io/docs/guides/service-config/).

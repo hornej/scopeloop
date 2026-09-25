@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.metadata
+import json
 import logging
 from collections.abc import Callable
 from contextlib import suppress
@@ -223,7 +224,35 @@ class SaleaeLogicAnalyzer(Instrument):
                 self._manager = await loop.run_in_executor(None, Manager.launch)
             else:
                 self._manager = await loop.run_in_executor(
-                    None, lambda: Manager.connect(port=self.port, connect_timeout_seconds=10)
+                    None,
+                    lambda: Manager.connect(
+                        port=self.port,
+                        connect_timeout_seconds=10,
+                        grpc_channel_arguments=[
+                            (
+                                "grpc.service_config",
+                                json.dumps(
+                                    {
+                                        "methodConfig": [
+                                            {
+                                                "name": [
+                                                    {
+                                                        "service": "saleae.automation.Manager",
+                                                        "method": method.name,
+                                                    }
+                                                    for method in saleae_pb2.DESCRIPTOR.services_by_name[
+                                                        "Manager"
+                                                    ].methods
+                                                    if method.name != "WaitCapture"
+                                                ],
+                                                "timeout": "60s",
+                                            }
+                                        ]
+                                    }
+                                ),
+                            )
+                        ],
+                    ),
                 )
 
             # Get devices
@@ -256,11 +285,16 @@ class SaleaeLogicAnalyzer(Instrument):
             )
 
         except BaseException as e:
-            if self._manager:
-                await asyncio.to_thread(self._manager.close)
-            self._lease.release()
-            self._connected = False
-            self._manager = None
+            try:
+                if self._manager:
+                    with suppress(Exception):
+                        await asyncio.to_thread(self._manager.close)
+            finally:
+                self._lease.release()
+                self._connected = False
+                self._manager = None
+            if isinstance(e, asyncio.CancelledError):
+                raise
             raise InstrumentError(f"Failed to connect to Saleae: {e}") from e
 
     @serialized
@@ -292,12 +326,11 @@ class SaleaeLogicAnalyzer(Instrument):
                 model="Saleae Logic",
             )
 
-        software = await self.get_software_info()
         return InstrumentInfo(
             instrument_type="logic_analyzer",
             model=str(self._device.device_type),
             serial=self._device.device_id,
-            firmware_version=software.get("logic_app_version"),
+            firmware_version=None,  # Device firmware is not exposed by the automation API.
             address=f"localhost:{self.port}",
         )
 
@@ -445,16 +478,25 @@ class SaleaeLogicAnalyzer(Instrument):
 
         wait_future = loop.run_in_executor(None, do_wait)
         started = loop.time()
-        while not wait_future.done():
-            elapsed = loop.time() - started
-            self._emit_progress(
-                progress_callback,
-                waiting_state,
-                elapsed_seconds=round(elapsed, 3),
-                timeout_seconds=timeout_seconds,
-            )
-            await asyncio.wait({wait_future}, timeout=1.0)
-        await wait_future
+        try:
+            while not wait_future.done():
+                elapsed = loop.time() - started
+                self._emit_progress(
+                    progress_callback,
+                    waiting_state,
+                    elapsed_seconds=round(elapsed, 3),
+                    timeout_seconds=timeout_seconds,
+                )
+                await asyncio.wait({wait_future}, timeout=1.0)
+            await wait_future
+        except asyncio.CancelledError:
+            # Retain driver ownership until the worker's RPC has settled, so it
+            # cannot later stop a capture belonging to a new client.
+            with suppress(Exception):
+                await asyncio.shield(asyncio.to_thread(capture.stop))
+            with suppress(Exception):
+                await asyncio.shield(wait_future)
+            raise
 
     @serialized
     async def capture(

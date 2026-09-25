@@ -277,6 +277,14 @@ def find_device(
     asyncio.run(_find())
 
 
+@app.command("usb-diagnostics")
+def usb_diagnostics() -> None:
+    """Read OS USB inventory and enumeration errors without device recovery actions."""
+    from scopeloop.usb import inventory
+
+    console.print_json(json.dumps(inventory()))
+
+
 @app.command("diagnose-device")
 def diagnose_device(
     serial: Annotated[str | None, typer.Option("--serial")] = None,
