@@ -220,40 +220,36 @@ class SaleaeLogicAnalyzer(Instrument):
             # Run connection in thread pool since it's blocking
             loop = asyncio.get_event_loop()
 
-            if self.launch:
-                self._manager = await loop.run_in_executor(None, Manager.launch)
-            else:
-                self._manager = await loop.run_in_executor(
-                    None,
-                    lambda: Manager.connect(
-                        port=self.port,
-                        connect_timeout_seconds=10,
-                        grpc_channel_arguments=[
-                            (
-                                "grpc.service_config",
-                                json.dumps(
-                                    {
-                                        "methodConfig": [
-                                            {
-                                                "name": [
-                                                    {
-                                                        "service": "saleae.automation.Manager",
-                                                        "method": method.name,
-                                                    }
-                                                    for method in saleae_pb2.DESCRIPTOR.services_by_name[
-                                                        "Manager"
-                                                    ].methods
-                                                    if method.name != "WaitCapture"
-                                                ],
-                                                "timeout": "60s",
-                                            }
-                                        ]
-                                    }
-                                ),
-                            )
-                        ],
+            methods = saleae_pb2.DESCRIPTOR.services_by_name["Manager"].methods
+            options = [
+                (
+                    "grpc.service_config",
+                    json.dumps(
+                        {
+                            "methodConfig": [
+                                {
+                                    "name": [
+                                        {
+                                            "service": "saleae.automation.Manager",
+                                            "method": method.name,
+                                        }
+                                        for method in methods
+                                        if method.name != "WaitCapture"
+                                    ],
+                                    "timeout": "60s",
+                                }
+                            ]
+                        }
                     ),
                 )
+            ]
+            factory = Manager.launch if self.launch else Manager.connect
+            self._manager = await loop.run_in_executor(
+                None,
+                lambda: factory(
+                    port=self.port, connect_timeout_seconds=10, grpc_channel_arguments=options
+                ),
+            )
 
             # Get devices
             devices = await loop.run_in_executor(None, self._manager.get_devices)
