@@ -207,6 +207,50 @@ class SaleaeLogicAnalyzer(Instrument):
     def is_connected(self) -> bool:
         return self._connected
 
+    @staticmethod
+    async def _settle_worker(future: asyncio.Future) -> Any:
+        """Drain a worker even if the owning request is cancelled again."""
+        while not future.done():
+            try:
+                await asyncio.shield(future)
+            except asyncio.CancelledError:
+                continue
+        return future.result()
+
+    async def _run_rpc(
+        self,
+        operation: Callable[[], Any],
+        *,
+        cancelled_result: Callable[[Any], None] | None = None,
+    ) -> Any:
+        """Keep ownership until a blocking RPC and any orphan cleanup finish.
+
+        Cancelling an executor await does not stop its thread or the remote RPC.
+        Shield the future so a cancelled caller can still retrieve a newly created
+        manager/capture and dispose of it before another operation starts.
+        """
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(None, operation)
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            try:
+                result = await self._settle_worker(future)
+                if cancelled_result is not None:
+                    cleanup = loop.run_in_executor(None, lambda: cancelled_result(result))
+                    await self._settle_worker(cleanup)
+            except Exception as exc:
+                logger.warning("Saleae RPC/cleanup failed during cancellation: %s", exc)
+            raise
+
+    @staticmethod
+    def _dispose_started_capture(capture: Any) -> None:
+        """Stop and close only the handle created by this cancelled/failed request."""
+        try:
+            capture.stop()
+        finally:
+            capture.close()
+
     @serialized
     async def connect(self) -> None:
         """Connect to Logic 2 application."""
@@ -217,9 +261,6 @@ class SaleaeLogicAnalyzer(Instrument):
 
         self._lease.acquire()
         try:
-            # Run connection in thread pool since it's blocking
-            loop = asyncio.get_event_loop()
-
             methods = saleae_pb2.DESCRIPTOR.services_by_name["Manager"].methods
             options = [
                 (
@@ -244,15 +285,15 @@ class SaleaeLogicAnalyzer(Instrument):
                 )
             ]
             factory = Manager.launch if self.launch else Manager.connect
-            self._manager = await loop.run_in_executor(
-                None,
+            self._manager = await self._run_rpc(
                 lambda: factory(
                     port=self.port, connect_timeout_seconds=10, grpc_channel_arguments=options
                 ),
+                cancelled_result=lambda manager: manager.close(),
             )
 
             # Get devices
-            devices = await loop.run_in_executor(None, self._manager.get_devices)
+            devices = await self._run_rpc(self._manager.get_devices)
 
             if not devices:
                 raise InstrumentError("No Saleae devices found")
@@ -284,7 +325,7 @@ class SaleaeLogicAnalyzer(Instrument):
             try:
                 if self._manager:
                     with suppress(Exception):
-                        await asyncio.to_thread(self._manager.close)
+                        await self._run_rpc(self._manager.close)
             finally:
                 self._lease.release()
                 self._connected = False
@@ -301,17 +342,16 @@ class SaleaeLogicAnalyzer(Instrument):
 
         logger.info("Disconnecting from Saleae Logic 2")
 
-        if self._manager:
-            try:
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, self._manager.close)
-            except Exception as e:
-                logger.warning(f"Error closing manager: {e}")
-
-        self._manager = None
-        self._device = None
-        self._connected = False
-        self._lease.release()
+        try:
+            if self._manager:
+                await self._run_rpc(self._manager.close)
+        except Exception as e:
+            logger.warning(f"Error closing manager: {e}")
+        finally:
+            self._manager = None
+            self._device = None
+            self._connected = False
+            self._lease.release()
 
     @serialized
     async def get_info(self) -> InstrumentInfo:
@@ -340,8 +380,7 @@ class SaleaeLogicAnalyzer(Instrument):
         if not self._manager:
             raise InstrumentError("Not connected")
 
-        loop = asyncio.get_event_loop()
-        devices = await loop.run_in_executor(None, self._manager.get_devices)
+        devices = await self._run_rpc(self._manager.get_devices)
 
         return [
             {
@@ -368,9 +407,8 @@ class SaleaeLogicAnalyzer(Instrument):
         if not self._manager:
             return result
 
-        loop = asyncio.get_running_loop()
         try:
-            app_info = await loop.run_in_executor(None, self._manager.get_app_info)
+            app_info = await self._run_rpc(self._manager.get_app_info)
         except Exception as exc:
             result["app_info_error"] = str(exc)
             return result
@@ -484,14 +522,15 @@ class SaleaeLogicAnalyzer(Instrument):
                     timeout_seconds=timeout_seconds,
                 )
                 await asyncio.wait({wait_future}, timeout=1.0)
-            await wait_future
-        except asyncio.CancelledError:
-            # Retain driver ownership until the worker's RPC has settled, so it
-            # cannot later stop a capture belonging to a new client.
+            await asyncio.shield(wait_future)
+        except BaseException:
+            # A failed progress callback also leaves the blocking wait running.
+            # Retain ownership through stop and worker settlement on every exit,
+            # so the worker cannot later affect a new client's capture.
             with suppress(Exception):
-                await asyncio.shield(asyncio.to_thread(capture.stop))
+                await self._settle_worker(loop.run_in_executor(None, capture.stop))
             with suppress(Exception):
-                await asyncio.shield(wait_future)
+                await self._settle_worker(wait_future)
             raise
 
     @serialized
@@ -533,8 +572,6 @@ class SaleaeLogicAnalyzer(Instrument):
             sample_rate_digital,
             sample_rate_analog,
         )
-        loop = asyncio.get_running_loop()
-
         # Build device configuration
         glitch_filters = None
         if glitch_filter_ns:
@@ -580,7 +617,9 @@ class SaleaeLogicAnalyzer(Instrument):
         started_at = datetime.now(UTC).isoformat()
         self._emit_progress(progress_callback, "starting", capture_mode="timed")
         try:
-            capture = await loop.run_in_executor(None, do_capture)
+            capture = await self._run_rpc(
+                do_capture, cancelled_result=self._dispose_started_capture
+            )
         except Exception as exc:
             raise InstrumentError(
                 "Logic 2 rejected the channel/sample-rate configuration: "
@@ -588,16 +627,20 @@ class SaleaeLogicAnalyzer(Instrument):
                 f"analog={analog_channels}@{sample_rate_analog}: {exc}"
             ) from exc
 
-        self._emit_progress(progress_callback, "capturing", duration_seconds=duration)
-        await self._wait_for_capture(
-            capture,
-            wait_timeout_seconds or duration + 10.0,
-            progress_callback,
-            "capturing",
-        )
-        completed_at = datetime.now(UTC).isoformat()
-        self._emit_progress(progress_callback, "complete")
-
+        try:
+            self._emit_progress(progress_callback, "capturing", duration_seconds=duration)
+            await self._wait_for_capture(
+                capture,
+                wait_timeout_seconds or duration + 10.0,
+                progress_callback,
+                "capturing",
+            )
+            completed_at = datetime.now(UTC).isoformat()
+            self._emit_progress(progress_callback, "complete")
+        except BaseException:
+            with suppress(Exception):
+                await self._run_rpc(lambda: self._dispose_started_capture(capture))
+            raise
         return CaptureResult(
             capture_id=str(id(capture)),
             duration=duration,
@@ -665,8 +708,6 @@ class SaleaeLogicAnalyzer(Instrument):
         if trigger_edge.lower() not in {"rising", "falling"}:
             raise InstrumentError("Trigger edge must be 'rising' or 'falling'")
 
-        loop = asyncio.get_running_loop()
-
         # Map trigger edge
         trigger_type = (
             DigitalTriggerType.RISING
@@ -706,7 +747,9 @@ class SaleaeLogicAnalyzer(Instrument):
 
         started_at = datetime.now(UTC).isoformat()
         try:
-            capture = await loop.run_in_executor(None, do_capture)
+            capture = await self._run_rpc(
+                do_capture, cancelled_result=self._dispose_started_capture
+            )
         except Exception as exc:
             raise InstrumentError(
                 "Logic 2 rejected the triggered channel/sample-rate configuration: "
@@ -714,28 +757,30 @@ class SaleaeLogicAnalyzer(Instrument):
                 f"analog={analog_channels}@{sample_rate_analog}: {exc}"
             ) from exc
 
-        self._emit_progress(
-            progress_callback,
-            "armed",
-            trigger_channel=trigger_channel,
-            trigger_edge=trigger_edge.lower(),
-            pre_trigger_seconds=pre_trigger_seconds,
-            post_trigger_seconds=post_trigger_seconds,
-            timeout_seconds=trigger_timeout_seconds,
-        )
         try:
+            self._emit_progress(
+                progress_callback,
+                "armed",
+                trigger_channel=trigger_channel,
+                trigger_edge=trigger_edge.lower(),
+                pre_trigger_seconds=pre_trigger_seconds,
+                post_trigger_seconds=post_trigger_seconds,
+                timeout_seconds=trigger_timeout_seconds,
+            )
             await self._wait_for_capture(
                 capture,
                 trigger_timeout_seconds + post_trigger_seconds,
                 progress_callback,
                 "waiting_for_trigger",
             )
-        except CaptureTimeoutError:
-            self._emit_progress(progress_callback, "trigger_timeout")
+            completed_at = datetime.now(UTC).isoformat()
+            self._emit_progress(progress_callback, "complete")
+        except BaseException as exc:
+            with suppress(Exception):
+                await self._run_rpc(lambda: self._dispose_started_capture(capture))
+            if isinstance(exc, CaptureTimeoutError):
+                self._emit_progress(progress_callback, "trigger_timeout")
             raise
-        completed_at = datetime.now(UTC).isoformat()
-        self._emit_progress(progress_callback, "complete")
-
         return CaptureResult(
             capture_id=str(id(capture)),
             duration=pre_trigger_seconds + post_trigger_seconds,
@@ -783,8 +828,6 @@ class SaleaeLogicAnalyzer(Instrument):
         if not self._connected:
             raise InstrumentError("Not connected")
 
-        loop = asyncio.get_event_loop()
-
         logger.info(f"Adding {analyzer_type} analyzer")
 
         def do_add_analyzer() -> Any:
@@ -794,7 +837,7 @@ class SaleaeLogicAnalyzer(Instrument):
                 settings=settings,
             )
 
-        analyzer = await loop.run_in_executor(None, do_add_analyzer)
+        analyzer = await self._run_rpc(do_add_analyzer)
 
         return AnalyzerResult(
             analyzer_id=str(id(analyzer)),
@@ -822,8 +865,6 @@ class SaleaeLogicAnalyzer(Instrument):
         if not self._connected:
             raise InstrumentError("Not connected")
 
-        loop = asyncio.get_event_loop()
-
         radix_map = {
             "hexadecimal": RadixType.HEXADECIMAL,
             "decimal": RadixType.DECIMAL,
@@ -843,7 +884,7 @@ class SaleaeLogicAnalyzer(Instrument):
                 ],
             )
 
-        await loop.run_in_executor(None, do_export)
+        await self._run_rpc(do_export)
         logger.info(f"Exported analyzer data to {output_path}")
 
     @serialized
@@ -866,7 +907,6 @@ class SaleaeLogicAnalyzer(Instrument):
             raise InstrumentError("Not connected")
 
         output_dir.mkdir(parents=True, exist_ok=True)
-        loop = asyncio.get_running_loop()
 
         def do_export() -> None:
             capture._capture.export_raw_data_csv(
@@ -879,7 +919,7 @@ class SaleaeLogicAnalyzer(Instrument):
                 ),
             )
 
-        await loop.run_in_executor(None, do_export)
+        await self._run_rpc(do_export)
         paths = [
             path
             for path in (output_dir / "digital.csv", output_dir / "analog.csv")
@@ -900,19 +940,17 @@ class SaleaeLogicAnalyzer(Instrument):
             raise InstrumentError("Not connected")
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        loop = asyncio.get_running_loop()
 
         def do_save() -> None:
             capture._capture.save_capture(filepath=str(output_path))
 
-        await loop.run_in_executor(None, do_save)
+        await self._run_rpc(do_save)
         logger.info(f"Saved capture to {output_path}")
 
     @serialized
     async def close_capture(self, capture: CaptureResult) -> None:
         """Close a Logic capture tab and release its memory."""
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, capture._capture.close)
+        await self._run_rpc(capture._capture.close)
 
     @serialized
     async def load_capture(self, capture_path: Path) -> CaptureResult:
@@ -927,12 +965,10 @@ class SaleaeLogicAnalyzer(Instrument):
         if not self._connected or not self._manager:
             raise InstrumentError("Not connected")
 
-        loop = asyncio.get_event_loop()
-
         def do_load() -> Any:
             return self._manager.load_capture(str(capture_path))  # type: ignore
 
-        capture = await loop.run_in_executor(None, do_load)
+        capture = await self._run_rpc(do_load, cancelled_result=lambda capture: capture.close())
 
         return CaptureResult(
             capture_id=str(id(capture)),

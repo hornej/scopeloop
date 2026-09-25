@@ -335,6 +335,11 @@ class WaveformStore:
         metadata: WaveformMetadata,
     ) -> None:
         """Compute and cache measurements in metadata."""
+        # Metadata may be reused for another capture or loaded from a saved one.
+        # An invalid or unrequested recomputation must not retain an old number.
+        metadata.frequency = None
+        metadata.frequency_status = "not_requested"
+        metadata.frequency_details = {}
         metadata.vpp = float(np.max(samples) - np.min(samples))
         metadata.vmax = float(np.max(samples))
         metadata.vmin = float(np.min(samples))
@@ -376,6 +381,8 @@ class WaveformStore:
                     metadata.frequency = freq_result.value
             except Exception as e:
                 logger.debug(f"Could not compute frequency: {e}")
+                metadata.frequency_status = "measurement_error"
+                metadata.frequency_details = {"reason": str(e)}
 
     def _downsample_minmax(
         self,

@@ -1,6 +1,6 @@
 """ScopeLoop - Hardware development automation platform for LLM coding agents."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from scopeloop.config import Config, load_config
 from scopeloop.session import Session, SessionManager

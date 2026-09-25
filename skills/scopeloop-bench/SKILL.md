@@ -20,6 +20,9 @@ deployment switch. Staging and offline tests can proceed independently.
 - For ownership, enumeration or deployment, read `docs/bench-operations.md`.
   Reuse resource/session mechanisms; never reset a shared hub or preempt a test.
   Distinguish absent device, enumeration failure and application unresponsiveness.
+- For ngscopeclient or PulseView, read `docs/waveform-viewers.md`. Export saved,
+  verified evidence offline. Preserve sample timing and source limits; third-party
+  hardware control needs the same explicit handoff as other bench clients.
 
 Keep product-specific pin maps, calibration and qualification in the product
 repository. Keep host addresses/serials in private config. Verify installed CLI

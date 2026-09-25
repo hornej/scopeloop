@@ -79,11 +79,16 @@ class MeasurementEngine:
     ) -> MeasurementResult:
         """Compute frequency only after amplitude, electrical, and edge checks."""
         samples = np.asarray(samples, dtype=float)
-        if sample_rate <= 0 or len(samples) < 4 or not np.all(np.isfinite(samples)):
+        if (
+            not np.isfinite(sample_rate)
+            or sample_rate <= 0
+            or len(samples) < 4
+            or not np.all(np.isfinite(samples))
+        ):
             return self._invalid_frequency(
                 method,
                 "insufficient_data",
-                "Samples must be finite and sample_rate must be positive",
+                "Samples must be finite and sample_rate must be finite and positive",
             )
 
         low_percentile, high_percentile = np.percentile(samples, [5, 95])

@@ -11,7 +11,8 @@
 - Keep portable instrument behavior here, product mappings/results in the product
   repository, and host addresses, serials and topology in private configuration.
 - Read [scope evidence](docs/scope-capture.md), [logic evidence](docs/logic-capture.md)
-  and [host updates](docs/bench-operations.md) for the affected path. The focused
+  [viewer exports](docs/waveform-viewers.md), and [host updates](docs/bench-operations.md)
+  for the affected path. The focused
   [skill](skills/scopeloop-bench/SKILL.md) routes the same human-readable procedures.
 - Replay real response shapes offline, test failure paths and run `git diff --check`.
   Test the installed wheel and MCP discovery on the named hosts. Report exact

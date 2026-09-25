@@ -1056,8 +1056,31 @@ def show_config(
 
 
 # ============================================================================
-# Entry point
+# Saved evidence viewers
 # ============================================================================
+
+evidence_app = typer.Typer(help="Export saved evidence to ngscopeclient and PulseView.")
+app.add_typer(evidence_app, name="evidence")
+
+
+@evidence_app.command("export")
+def evidence_export(
+    bundle: Path,
+    output: Path,
+    max_samples: Annotated[
+        int, typer.Option(min=2, help="Maximum expanded samples per stream.")
+    ] = 50_000_000,
+) -> None:
+    """Verify a completed bundle and create offline viewer files in a new directory."""
+    from scopeloop.viewers import export_viewers
+
+    try:
+        result = export_viewers(bundle, output, max_samples)
+    except (OSError, ValueError, KeyError) as exc:
+        typer.echo(f"Export failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(json.dumps(result, indent=2))
+
 
 if __name__ == "__main__":
     app()

@@ -27,7 +27,7 @@ from scopeloop.config import (
 )
 from scopeloop.devices import DeviceManager, DeviceMatch
 from scopeloop.logic import LogicCaptureService
-from scopeloop.resources import ResourceManager, generate_client_id
+from scopeloop.resources import ResourceManager, TaskRLock, generate_client_id
 from scopeloop.safety import SafetyConfig, SafetyGuardrails
 from scopeloop.scope import create_scope_from_config, parse_si_value
 from scopeloop.session import SessionManager
@@ -44,6 +44,7 @@ _device_manager: DeviceManager | None = None
 _session_manager: SessionManager | None = None
 _safety: SafetyGuardrails | None = None
 _logic_service: LogicCaptureService | None = None
+_logic_lifecycle_lock = TaskRLock()
 _client_id: str = generate_client_id("mcp")
 
 
@@ -89,6 +90,23 @@ def _get_logic_service() -> LogicCaptureService:
 # ============================================================================
 
 TOOLS = [
+    Tool(
+        name="scopeloop_evidence_export",
+        description=(
+            "Verify saved evidence and export ngscopeclient CSV and PulseView SR files offline."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "bundle": {"type": "string", "description": "Completed source evidence directory."},
+                "output": {
+                    "type": "string", "description": "New directory outside the source bundle."
+                },
+                "max_samples": {"type": "integer", "minimum": 2, "default": 50000000},
+            },
+            "required": ["bundle", "output"],
+        },
+    ),
     Tool(
         name="scopeloop_status",
         description=(
@@ -575,7 +593,23 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
 
 async def _handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Keep configuration replacement serialized with persistent Logic operations."""
+    if name == "scopeloop_init" or name.startswith("scopeloop_logic_"):
+        async with _logic_lifecycle_lock:
+            return await _dispatch_tool(name, args)
+    return await _dispatch_tool(name, args)
+
+
+async def _dispatch_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     """Route tool calls to handlers."""
+
+    if name == "scopeloop_evidence_export":
+        from scopeloop.viewers import export_viewers
+
+        return await asyncio.to_thread(
+            export_viewers, Path(args["bundle"]), Path(args["output"]),
+            args.get("max_samples", 50_000_000),
+        )
 
     # Status and init tools
     if name == "scopeloop_status":
@@ -737,7 +771,10 @@ async def _handle_init(args: dict[str, Any]) -> dict[str, Any]:
     config_path = create_default_config(project_name, mcu, path)
 
     # Reload config
-    _config = load_config(config_path)
+    next_config = load_config(config_path)
+    if _logic_service is not None:
+        await _logic_service.disconnect(close_captures=True)
+    _config = next_config
     _logic_service = None
 
     return {

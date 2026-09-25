@@ -1,5 +1,6 @@
 """Tests that MCP logic handlers route to the shared functional workflow."""
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -7,6 +8,7 @@ import pytest
 import scopeloop.mcp_server as mcp_server
 from scopeloop.config import Config
 from scopeloop.logic import EvidenceBundle
+from scopeloop.resources import TaskRLock
 
 
 class FakeLogicService:
@@ -79,3 +81,38 @@ async def test_mcp_logic_decode_save_and_export_are_implemented(mcp_logic, tmp_p
     assert decoded["decoded_csv"].endswith("uart.csv")
     assert saved["saved_capture"].endswith("copy.sal")
     assert exported["raw_csv"][0].endswith("digital.csv")
+
+
+@pytest.mark.asyncio
+async def test_init_waits_for_logic_operation_and_closes_owned_captures(monkeypatch, tmp_path):
+    started, release = asyncio.Event(), asyncio.Event()
+    closed = []
+
+    class ConnectedService:
+        async def connect(self):
+            started.set()
+            await release.wait()
+            return {"connected": True}
+
+        async def disconnect(self, close_captures=False):
+            closed.append(close_captures)
+
+    monkeypatch.setattr(mcp_server, "_logic_lifecycle_lock", TaskRLock())
+    monkeypatch.setattr(mcp_server, "_logic_service", ConnectedService())
+    monkeypatch.setattr(mcp_server, "_config", None)
+    capture = asyncio.create_task(mcp_server._handle_tool("scopeloop_logic_connect", {}))
+    await started.wait()
+    replacement = asyncio.create_task(
+        mcp_server._handle_tool(
+            "scopeloop_init", {"project_name": "replacement", "path": str(tmp_path)}
+        )
+    )
+    await asyncio.sleep(0)
+    assert not replacement.done()
+    assert not (tmp_path / "scopeloop.yaml").exists()
+    release.set()
+    await capture
+    assert (await replacement)["success"]
+    assert closed == [True]
+    assert mcp_server._logic_service is None
+    assert mcp_server._config.project.name == "replacement"

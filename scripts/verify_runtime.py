@@ -27,6 +27,7 @@ async def discover():
                 "scopeloop_scope_capture",
                 "scopeloop_logic_capture",
                 "scopeloop_logic_disconnect",
+                "scopeloop_evidence_export",
             ):
                 assert required in names, required
             return names

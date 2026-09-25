@@ -11,6 +11,8 @@ from typing import Any, Literal, cast
 
 import numpy as np
 
+from scopeloop.evidence import require_artifact, validate_bundle
+
 
 @dataclass
 class SignalTrace:
@@ -83,8 +85,13 @@ def compare_bundles(
     selected_channels: list[int] | None = None,
 ) -> dict[str, Any]:
     """Compare two evidence bundles after proving their capture settings match."""
-    reference_manifest = _read_json(reference_bundle / "manifest.json")
-    dut_manifest = _read_json(dut_bundle / "manifest.json")
+    reference_manifest = validate_bundle(reference_bundle)
+    dut_manifest = validate_bundle(dut_bundle)
+    for manifest in (reference_manifest, dut_manifest):
+        require_artifact(manifest, "channel-map.json")
+        for kind in ("digital", "analog"):
+            if manifest.get("recipe", {}).get(f"{kind}_channels"):
+                require_artifact(manifest, f"raw/{kind}.csv")
     settings = _comparable_settings(reference_manifest)
     dut_settings = _comparable_settings(dut_manifest)
     if settings != dut_settings:
@@ -95,6 +102,13 @@ def compare_bundles(
 
     reference = load_bundle_traces(reference_bundle)
     dut = load_bundle_traces(dut_bundle)
+    for manifest, traces in ((reference_manifest, reference), (dut_manifest, dut)):
+        for kind in ("digital", "analog"):
+            actual = {channel for channel, choices in traces.items()
+                      if any(trace.kind == kind for trace in choices)}
+            declared = set(manifest["recipe"].get(f"{kind}_channels") or [])
+            if actual != declared:
+                raise ValueError(f"Evidence {kind} channel coverage differs from the recipe")
     reference_align = _preferred_trace(reference, align_channel)
     dut_align = _preferred_trace(dut, align_channel)
     reference_alignment_s = find_edge(reference_align, edge, threshold_v)
@@ -208,10 +222,16 @@ def _trace_metrics(trace: SignalTrace, alignment_s: float) -> dict[str, Any]:
         final_value = float(np.median(values[max(0, int(len(values) * 0.9)) :]))
         tolerance = max(abs(final_value) * 0.05, float(np.ptp(values)) * 0.02, 0.01)
         outside = np.flatnonzero(np.abs(values - final_value) > tolerance)
-        settle_index = int(outside[-1] + 1) if len(outside) and outside[-1] + 1 < len(values) else 0
+        settle_index = int(outside[-1] + 1) if len(outside) else 0
         metrics["final_value"] = final_value
         metrics["settling_tolerance"] = tolerance
-        metrics["settling_time_s"] = float(times[settle_index])
+        metrics["settling_time_s"] = (
+            float(times[settle_index]) if settle_index < len(values) - 1 else None
+        )
+        metrics["settling_observation_end_s"] = float(times[-1])
+        metrics["settling_status"] = (
+            "observed" if metrics["settling_time_s"] is not None else "not_observed"
+        )
     if trace.signal_type in {"logic", "reset", "strap", "uart", "clock"}:
         metrics["transition_times_s"] = [float(times[index]) for index in edges[:100]]
     return metrics

@@ -184,6 +184,40 @@ async def test_evidence_hashes_and_noise_floor(monkeypatch, tmp_path):
         assert json.loads((tmp_path / "failed/manifest.json").read_text())["status"] == "failed"
 
 
+@pytest.mark.parametrize("mismatch", ["points", "offset"])
+async def test_noise_floor_rejects_different_coverage_or_offset(monkeypatch, tmp_path, mismatch):
+    base = {"signal": "rail", "probe": "10x", "connection": "TP", "ground": "spring",
+            "limitations": []}
+    async with replay(monkeypatch, tmp_path, payload=bytes([0, 0, 100, 156])) as (scope, _):
+        baseline = tmp_path / "noise"
+        noise = await capture_scope_evidence(
+            scope,
+            ScopeRecipe(kind="noise_floor", points=2 if mismatch == "points" else None, **base),
+            baseline,
+        )
+        if mismatch == "points":
+            assert noise["measurements"]["peak_to_peak_v"] == 0
+        else:
+            query = scope._query
+
+            async def shifted_offset(command):
+                result = await query(command)
+                return "C1:OFST -1.00E+00V" if command == "C1:OFST?" else result
+
+            monkeypatch.setattr(scope, "_query", shifted_offset)
+        with pytest.raises(ValueError, match="setup differs"):
+            await capture_scope_evidence(
+                scope,
+                ScopeRecipe(
+                    kind="ripple", noise_floor_manifest=baseline / "manifest.json", **base
+                ),
+                tmp_path / "ripple",
+            )
+        failed = json.loads((tmp_path / "ripple/manifest.json").read_text())
+        assert failed["status"] == "failed"
+        assert failed["noise_floor"] is None
+
+
 def test_load_step_windows_and_observation_limit():
     recipe = ScopeRecipe(
         kind="load_step",

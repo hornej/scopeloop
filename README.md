@@ -8,6 +8,7 @@ ScopeLoop enables AI coding assistants like Claude Code to autonomously develop 
 
 - [Scope ripple, noise floor and load-step evidence](docs/scope-capture.md)
 - [Saleae capture, decode and native labels](docs/logic-capture.md)
+- [ngscopeclient and PulseView exports](docs/waveform-viewers.md)
 - [Ownership, device diagnostics and runtime updates](docs/bench-operations.md)
 - [Host setup](docs/host-setup.md)
 - [Focused ScopeLoop skill](skills/scopeloop-bench/SKILL.md)
@@ -19,6 +20,7 @@ ScopeLoop enables AI coding assistants like Claude Code to autonomously develop 
 - **Serial Monitoring**: Capture and analyze serial output with timestamped logs
 - **Oscilloscope Control**: Siglent SDS1000X-E integration for waveform capture and measurement
 - **Logic Analyzer**: Saleae Logic 2 integration for digital signal analysis
+- **Offline Viewers**: Verified evidence exports to ngscopeclient CSV and native PulseView sessions
 - **Fixture Layer**: Model relays, Qwiic sensors, cameras, probes, and custom DUT actuation
 - **Safety Guardrails**: Boot loop detection, circuit breakers, and rate limiting
 - **Session Management**: Complete audit trail with artifacts and event timeline

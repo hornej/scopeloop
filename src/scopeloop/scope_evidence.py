@@ -90,10 +90,17 @@ def waveform_metrics(waveform, recipe: ScopeRecipe) -> dict:
 def _setup_signature(waveform: dict) -> dict:
     setup = waveform["metadata"]["setup"]
     return {
-        key: value
-        for key, value in setup.items()
-        if key in {"*IDN?", "SARA?", "TDIV?", "BWL?", "ACQW?"}
-        or key.endswith((":VDIV?", ":CPL?", ":ATTN?"))
+        "setup": {
+            key: value
+            for key, value in setup.items()
+            if key in {"*IDN?", "SARA?", "TDIV?", "BWL?", "ACQW?"}
+            or key.endswith((":VDIV?", ":OFST?", ":CPL?", ":ATTN?"))
+        },
+        # Equal front-panel timebase/rate does not imply equal transferred coverage:
+        # a points limit can hide noise peaks and understate the baseline.
+        "record_length": waveform["record_length"],
+        "sample_rate": waveform["sample_rate"],
+        "time_offset": waveform["time_offset"],
     }
 
 

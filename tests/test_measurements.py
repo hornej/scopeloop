@@ -37,6 +37,13 @@ def square_wave():
 
 
 class TestFrequencyMeasurement:
+    @pytest.mark.parametrize("sample_rate", [float("nan"), float("inf"), -float("inf")])
+    def test_nonfinite_sample_rate_is_invalid(self, engine, sine_wave, sample_rate):
+        samples, _ = sine_wave
+        result = engine.frequency(samples, sample_rate)
+        assert result.value is None
+        assert result.status == "insufficient_data"
+
     def test_sine_frequency_zero_crossing(self, engine, sine_wave):
         samples, sample_rate = sine_wave
         result = engine.frequency(samples, sample_rate, method="zero_crossing")
