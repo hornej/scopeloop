@@ -6,6 +6,7 @@ import json
 import platform
 import subprocess
 import sys
+import sysconfig
 from pathlib import Path
 
 from mcp import ClientSession, StdioServerParameters
@@ -32,7 +33,7 @@ async def discover():
 
 
 def main():
-    cli = Path(sys.executable).parent / (
+    cli = Path(sysconfig.get_path("scripts")) / (
         "scopeloop.exe" if sys.platform == "win32" else "scopeloop"
     )
     for args in (["--help"], ["scope", "--help"], ["logic", "--help"]):
