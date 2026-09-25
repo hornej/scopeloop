@@ -128,7 +128,13 @@ class SiglentSDS1000X(Instrument):
             print(f"Captured {len(waveform.samples)} samples")
     """
 
-    def __init__(self, address: str, port: int = 5025, timeout: float = 10.0):
+    def __init__(
+        self,
+        address: str,
+        port: int = 5025,
+        timeout: float = 10.0,
+        expected_serial: str | None = None,
+    ):
         """Initialize the oscilloscope driver.
 
         Args:
@@ -136,6 +142,7 @@ class SiglentSDS1000X(Instrument):
             port: SCPI port (default 5025 for raw socket).
             timeout: Command timeout in seconds.
         """
+        self.expected_serial = expected_serial
         self.address = address
         self.port = port
         self.timeout = timeout
@@ -179,6 +186,8 @@ class SiglentSDS1000X(Instrument):
 
             # Verify connection
             idn = await self._query("*IDN?")
+            if self.expected_serial and idn.split(",")[2].strip() != self.expected_serial:
+                raise InstrumentError("Scope serial does not match configured identity")
             logger.info(f"Connected to: {idn}")
 
         except BaseException:

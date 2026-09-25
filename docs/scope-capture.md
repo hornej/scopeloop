@@ -21,6 +21,9 @@ invoke the host runtime over SSH instead of independently opening the scope.
 }
 ```
 
+Set `instruments.oscilloscope.expected_serial` in private configuration to reject
+a different instrument at a reused IP address before any setup writes.
+
 Configure coupling, attenuation, bandwidth, scale, offset and trigger deliberately
 before capture. Only SAMPLING acquisition is currently supported; averaging,
 peak detect, interpolation, math traces and other models need separate validation.

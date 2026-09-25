@@ -17,7 +17,7 @@ def create_scope_from_config(config: Config) -> SiglentSDS1000X:
         raise ScopeConfigError("No oscilloscope configured in scopeloop.yaml")
 
     address, port = _siglent_address_and_port(oscilloscope)
-    return SiglentSDS1000X(address, port=port)
+    return SiglentSDS1000X(address, port=port, expected_serial=oscilloscope.expected_serial)
 
 
 def parse_si_value(value: str | float | int) -> float:

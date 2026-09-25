@@ -182,3 +182,14 @@ async def test_second_client_refused_before_scpi(monkeypatch, tmp_path):
         with pytest.raises(Exception, match="Resource busy"):
             await other.connect()
         assert commands == ["*IDN?"]
+
+
+async def test_identity_mismatch_prevents_setup(monkeypatch, tmp_path):
+    async with replay(monkeypatch, tmp_path) as (scope, commands):
+        port = scope.port
+        await scope.disconnect()
+        other = SiglentSDS1000X("127.0.0.1", port, expected_serial="wrong")
+        with pytest.raises(InstrumentError, match="serial"):
+            await other.connect()
+        assert not other.is_connected
+        assert all(command == "*IDN?" for command in commands)

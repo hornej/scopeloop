@@ -41,6 +41,7 @@ class OscilloscopeConfig(BaseModel):
     driver: str | None = None  # sigrok driver name (e.g., "siglent-sds")
     address: str | None = None  # IP address for network devices
     connection: str | None = None  # sigrok connection string
+    expected_serial: str | None = None
     probes: dict[str, ProbeConfig] = Field(default_factory=dict)
 
 
