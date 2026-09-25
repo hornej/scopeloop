@@ -24,6 +24,8 @@ from scopeloop.instruments.saleae import (
     VoltageThreshold,
     uart_analyzer_settings,
 )
+from scopeloop.resources import TaskRLock, serialized
+from scopeloop.saleae_labels import label_and_verify
 
 
 class LogicDriver(Protocol):
@@ -104,6 +106,7 @@ class LogicCaptureService:
             raise InstrumentError(
                 "Recipe evidence bundles currently require logic_analyzer.type: saleae"
             )
+        self._lock = TaskRLock()
         self.config = config
         self.driver = cast(
             LogicDriver,
@@ -117,6 +120,7 @@ class LogicCaptureService:
         self.analyzers: dict[str, dict[str, AnalyzerResult]] = {}
         self.progress: dict[str, list[dict[str, Any]]] = {}
 
+    @serialized
     async def connect(self) -> dict[str, Any]:
         if not self.driver.is_connected:
             await self.driver.connect()
@@ -129,6 +133,7 @@ class LogicCaptureService:
             "devices": await self._list_devices_if_available(),
         }
 
+    @serialized
     async def disconnect(self, close_captures: bool = False) -> None:
         if close_captures:
             for capture in list(self.captures.values()):
@@ -139,6 +144,7 @@ class LogicCaptureService:
         if self.driver.is_connected:
             await self.driver.disconnect()
 
+    @serialized
     async def _list_devices_if_available(self) -> list[dict[str, Any]]:
         list_devices = getattr(self.driver, "list_devices", None)
         if not list_devices:
@@ -152,11 +158,14 @@ class LogicCaptureService:
             choices = ", ".join(sorted(self.config.recipes)) or "none configured"
             raise InstrumentError(f"Unknown capture recipe '{name}' ({choices})") from exc
 
+    @serialized
     async def capture_evidence(
         self,
         recipe_name: str,
         run_metadata: dict[str, Any],
         output_root: Path,
+        *,
+        native_labels: bool = False,
     ) -> EvidenceBundle:
         """Run one recipe and automatically persist its complete evidence bundle."""
         recipe = self.get_recipe(recipe_name)
@@ -200,6 +209,9 @@ class LogicCaptureService:
 
             channel_map = self._channel_map(recipe)
             self._write_json(bundle_dir / "channel-map.json", channel_map)
+            labels = {"native_labels_applied": False, "native_reopen_verified": False}
+            if native_labels:
+                labels = await label_and_verify(self.driver, sal_path, channel_map)
             instrument = await self.driver.get_info()
             software = await self.driver.get_software_info()
             completed_at = datetime.now(UTC).isoformat()
@@ -218,18 +230,7 @@ class LogicCaptureService:
                 "capture_progress": progress,
                 "instrument": asdict(instrument),
                 "software": software,
-                "channel_labels": {
-                    "authoritative_source": "channel-map.json",
-                    "native_labels_requested": any(
-                        self.config.channels.get(channel) and self.config.channels[channel].label
-                        for channel in set(recipe.digital_channels + recipe.analog_channels)
-                    ),
-                    "native_labels_applied": False,
-                    "limitation": (
-                        "The official Logic 2 automation API does not expose native channel "
-                        "label mutation. The untouched .sal is not claimed to be labeled."
-                    ),
-                },
+                "channel_labels": labels,
                 "files": files,
             }
             manifest_path = bundle_dir / "manifest.json"
@@ -251,6 +252,7 @@ class LogicCaptureService:
             self._write_json(bundle_dir / "manifest.json", failure)
             raise
 
+    @serialized
     async def _capture_recipe(
         self,
         recipe: LogicCaptureRecipeConfig,
@@ -281,6 +283,7 @@ class LogicCaptureService:
             progress_callback=progress_callback,
         )
 
+    @serialized
     async def _add_uart_analyzers(
         self,
         capture: CaptureResult,
@@ -305,17 +308,20 @@ class LogicCaptureService:
             )
         return results
 
+    @serialized
     async def load_capture(self, capture_path: Path) -> CaptureResult:
         await self.connect()
         capture = await self.driver.load_capture(capture_path.resolve())
         self.captures[capture.capture_id] = capture
         return capture
 
+    @serialized
     async def save_capture(self, capture_id: str, output_path: Path) -> Path:
         capture = self._get_capture(capture_id)
         await self.driver.save_capture(capture, output_path.resolve())
         return output_path.resolve()
 
+    @serialized
     async def export_capture(
         self,
         capture_id: str,
@@ -331,6 +337,7 @@ class LogicCaptureService:
             analog_channels,
         )
 
+    @serialized
     async def decode_uart(
         self,
         capture_id: str,

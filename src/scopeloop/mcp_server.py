@@ -29,6 +29,7 @@ from scopeloop.devices import DeviceManager, DeviceMatch
 from scopeloop.logic import LogicCaptureService
 from scopeloop.resources import ResourceManager, generate_client_id
 from scopeloop.safety import SafetyConfig, SafetyGuardrails
+from scopeloop.scope import create_scope_from_config, parse_si_value
 from scopeloop.session import SessionManager
 
 logger = logging.getLogger(__name__)
@@ -275,17 +276,17 @@ TOOLS = [
     ),
     Tool(
         name="scopeloop_scope_capture",
-        description="Capture waveform data from the oscilloscope.",
+        description="Acquire fresh scope evidence with setup, waveform, measurements and hashes.",
         inputSchema={
             "type": "object",
             "properties": {
-                "channel": {
-                    "type": "string",
-                    "description": "Channel to capture (e.g., 'CH1')",
-                    "default": "CH1",
+                "recipe": {
+                    "type": "object",
+                    "description": "ScopeRecipe from docs/scope-capture.md",
                 },
+                "output": {"type": "string", "description": "New evidence directory"},
             },
-            "required": [],
+            "required": ["recipe", "output"],
         },
     ),
     Tool(
@@ -345,6 +346,11 @@ TOOLS = [
         },
     ),
     Tool(
+        name="scopeloop_logic_disconnect",
+        description="Close owned captures and release this MCP client's Logic lease.",
+        inputSchema={"type": "object", "properties": {}},
+    ),
+    Tool(
         name="scopeloop_logic_capture",
         description="Run a configured logic capture recipe and save an evidence bundle.",
         inputSchema={
@@ -360,6 +366,7 @@ TOOLS = [
                     "additionalProperties": True,
                 },
                 "output_root": {"type": "string"},
+                "native_labels": {"type": "boolean", "default": False},
             },
             "required": ["recipe", "metadata"],
         },
@@ -613,6 +620,9 @@ async def _handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     # Logic analyzer tools
     elif name == "scopeloop_logic_connect":
         return await _handle_logic_connect()
+    elif name == "scopeloop_logic_disconnect":
+        await _get_logic_service().disconnect(close_captures=True)
+        return {"connected": False}
     elif name == "scopeloop_logic_capture":
         return await _handle_logic_capture(args)
     elif name == "scopeloop_logic_decode":
@@ -680,6 +690,7 @@ async def _handle_status() -> dict[str, Any]:
                     vid=device_config.match.vid,
                     pid=device_config.match.pid,
                     serial=device_config.match.serial,
+                    by_id=device_config.match.by_id,
                 )
             )
             devices.append(
@@ -764,6 +775,7 @@ async def _handle_device_find(args: dict[str, Any]) -> dict[str, Any]:
             vid=args.get("vid"),
             pid=args.get("pid"),
             serial=args.get("serial"),
+            by_id=args.get("by_id"),
         )
     )
 
@@ -879,44 +891,93 @@ async def _handle_scope_connect() -> dict[str, Any]:
     if not config or not config.instruments.oscilloscope:
         return {"error": "No oscilloscope configured in scopeloop.yaml"}
 
-    # TODO: Implement oscilloscope connection
-    return {
-        "status": "not_implemented",
-        "message": "Oscilloscope integration not yet implemented",
-        "type": config.instruments.oscilloscope.type,
-        "address": config.instruments.oscilloscope.address,
-    }
+    try:
+        scope = create_scope_from_config(config)
+        async with scope:
+            info = await scope.get_info()
+            return {
+                "status": "identified",
+                "connected": False,
+                "type": info.instrument_type,
+                "model": info.model,
+                "serial": info.serial,
+                "firmware_version": info.firmware_version,
+                "address": info.address,
+            }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 async def _handle_scope_capture(args: dict[str, Any]) -> dict[str, Any]:
     """Handle scopeloop_scope_capture tool."""
-    # TODO: Implement scope capture
-    return {
-        "status": "not_implemented",
-        "message": "Oscilloscope integration not yet implemented",
-    }
+    config = _get_config()
+    if not config or not config.instruments.oscilloscope:
+        return {"error": "No oscilloscope configured in scopeloop.yaml"}
+
+    try:
+        scope = create_scope_from_config(config)
+        async with scope:
+            from scopeloop.scope_evidence import ScopeRecipe, capture_scope_evidence
+
+            recipe = ScopeRecipe.model_validate(args["recipe"])
+            return await capture_scope_evidence(scope, recipe, Path(args["output"]))
+    except Exception as e:
+        return {"error": str(e)}
 
 
 async def _handle_scope_measure(args: dict[str, Any]) -> dict[str, Any]:
     """Handle scopeloop_scope_measure tool."""
-    # TODO: Implement scope measurement
-    return {
-        "status": "not_implemented",
-        "message": "Oscilloscope integration not yet implemented",
-        "requested": {
-            "channel": args.get("channel"),
-            "measurement": args.get("measurement"),
-        },
-    }
+    config = _get_config()
+    if not config or not config.instruments.oscilloscope:
+        return {"error": "No oscilloscope configured in scopeloop.yaml"}
+
+    try:
+        scope = create_scope_from_config(config)
+        async with scope:
+            measurement = await scope.measure(
+                args.get("channel", "CH1"),
+                args["measurement"],
+            )
+            return {
+                "status": "measured",
+                "measurement": measurement.to_dict(),
+            }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 async def _handle_scope_configure(args: dict[str, Any]) -> dict[str, Any]:
     """Handle scopeloop_scope_configure tool."""
-    # TODO: Implement scope configuration
-    return {
-        "status": "not_implemented",
-        "message": "Oscilloscope integration not yet implemented",
-    }
+    config = _get_config()
+    if not config or not config.instruments.oscilloscope:
+        return {"error": "No oscilloscope configured in scopeloop.yaml"}
+
+    channel = args.get("channel", "CH1")
+    applied: dict[str, Any] = {}
+
+    try:
+        scope = create_scope_from_config(config)
+        async with scope:
+            if args.get("scale") is not None:
+                scale = parse_si_value(args["scale"])
+                await scope.set_channel_scale(channel, scale)
+                applied["scale"] = scale
+            if args.get("timebase") is not None:
+                timebase = parse_si_value(args["timebase"])
+                await scope.set_timebase(timebase)
+                applied["timebase"] = timebase
+            if args.get("trigger_level") is not None:
+                trigger_level = float(args["trigger_level"])
+                await scope.set_trigger_level(trigger_level, source=channel)
+                applied["trigger_level"] = trigger_level
+
+        return {
+            "status": "configured",
+            "channel": channel,
+            "applied": applied,
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 async def _handle_logic_connect() -> dict[str, Any]:
@@ -936,6 +997,7 @@ async def _handle_logic_capture(args: dict[str, Any]) -> dict[str, Any]:
         args["recipe"],
         args.get("metadata", {}),
         output_root,
+        **({"native_labels": True} if args.get("native_labels") else {}),
     )
     return bundle.to_dict()
 

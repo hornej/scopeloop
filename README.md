@@ -4,6 +4,14 @@ Hardware development automation platform for LLM coding agents.
 
 ScopeLoop enables AI coding assistants like Claude Code to autonomously develop and debug embedded firmware by providing direct access to hardware tools, build systems, and measurement instruments.
 
+## Bench workflows
+
+- [Scope ripple, noise floor and load-step evidence](docs/scope-capture.md)
+- [Saleae capture, decode and native labels](docs/logic-capture.md)
+- [Ownership, device diagnostics and runtime updates](docs/bench-operations.md)
+- [Host setup](docs/host-setup.md)
+- [Focused ScopeLoop skill](skills/scopeloop-bench/SKILL.md)
+
 ## Features
 
 - **MCP Integration**: Exposes hardware tools directly to Claude Code via Model Context Protocol
@@ -19,7 +27,7 @@ ScopeLoop enables AI coding assistants like Claude Code to autonomously develop 
 
 ```bash
 python -m venv .venv
-.venv/bin/python -m pip install -e ".[dev,all-instruments]"
+.venv/bin/python -m pip install -e ".[dev,saleae]"
 ```
 
 ## Quick Start

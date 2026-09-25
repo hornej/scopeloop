@@ -159,12 +159,9 @@ capability query for enumerating all supported combinations, so ScopeLoop
 performs structural checks first and returns the complete rejected combination
 if Logic 2 refuses it.
 
-The official API can label protocol analyzers but does not expose native Logic
-channel-label mutation. ScopeLoop therefore never claims that `capture.sal` is
-labeled. `channel-map.json` is authoritative and the manifest records
-`native_labels_applied: false`. If a project uses a separately verified Logic
-UI/archive-labeling process, preserve the original capture alongside any
-derived labeled copy.
+The official API labels protocol analyzers but has no native channel-label setter.
+By default the SAL remains untouched and `native_labels_applied` is false. For a
+verified native copy, use the [native labels workflow](#verified-native-labels).
 
 ## Known-good versus DUT comparison
 
@@ -196,3 +193,19 @@ excursions when electrical limits apply, enough cycles, and consistent edge
 spacing. Rejected results use an explicit status such as
 `insufficient_amplitude`, `indeterminate_logic_levels`, or `poor_edge_quality`;
 they are not reported as a zero-hertz or apparent clock measurement.
+
+## Verified native labels
+
+Pass `--native-labels` to `scopeloop logic capture`, or `native_labels: true`
+to the MCP capture tool, to label the native archive as well as its sidecar.
+The workflow preserves `capture.sal`, creates `capture-labeled.sal`, opens it in
+Logic and saves `capture-labeled-verified.sal`. It checks the actual saved
+`meta.json` channel rows and hashes the original before/after. Only that successful
+round trip sets `native_labels_applied` and `native_reopen_verified` true.
+
+This extends the original recipe service and ports the private PowerShell helper's
+archive operation. Logic has no public native label setter; the archive schema is
+version-sensitive. Mismatched/missing labels or a failed reopen make the bundle
+fail, with the original still available. Digital/analog views of one physical
+channel must have the same name. Without the option, the untouched SAL is not
+claimed to be labeled. Sidecar entries may be simple names or objects with `name`.

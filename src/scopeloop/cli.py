@@ -25,6 +25,7 @@ from scopeloop.host import collect_host_status, format_bytes
 from scopeloop.instruments.base import InstrumentError
 from scopeloop.logic import LogicCaptureService, parse_metadata
 from scopeloop.safety import GuardrailType, SafetyConfig, SafetyGuardrails
+from scopeloop.scope import ScopeConfigError, create_scope_from_config, parse_si_value
 from scopeloop.session import SessionManager
 
 app = typer.Typer(
@@ -274,6 +275,284 @@ def find_device(
             console.print("[yellow]Device not found.[/yellow]")
 
     asyncio.run(_find())
+
+
+@app.command("diagnose-device")
+def diagnose_device(
+    serial: Annotated[str | None, typer.Option("--serial")] = None,
+    by_id: Annotated[str | None, typer.Option("--by-id")] = None,
+    vid: Annotated[str | None, typer.Option("--vid")] = None,
+    pid: Annotated[str | None, typer.Option("--pid")] = None,
+) -> None:
+    """Report absent, ambiguous or failed enumeration without opening hardware."""
+    result = asyncio.run(
+        DeviceManager().diagnose(DeviceMatch(serial=serial, by_id=by_id, vid=vid, pid=pid))
+    )
+    console.print_json(json.dumps(result))
+
+
+# ============================================================================
+# Scope command
+# ============================================================================
+
+
+scope_app = typer.Typer(help="Control the configured oscilloscope.")
+app.add_typer(scope_app, name="scope")
+
+
+def _load_configured_scope(config_path: Path | None):
+    try:
+        config = load_config(config_path)
+        return create_scope_from_config(config)
+    except (FileNotFoundError, ScopeConfigError, ValueError) as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1) from e
+
+
+@scope_app.command("capture")
+def scope_capture(
+    recipe: Annotated[Path, typer.Argument(help="Scope evidence recipe JSON.")],
+    output: Annotated[Path, typer.Argument(help="New evidence directory.")],
+    config_path: Annotated[Path | None, typer.Option("--config", "-c")] = None,
+) -> None:
+    """Save a fresh ripple/noise-floor/load-step capture and its raw evidence."""
+    from scopeloop.scope_evidence import ScopeRecipe, capture_scope_evidence
+
+    parsed = ScopeRecipe.model_validate_json(recipe.read_text())
+
+    async def capture():
+        async with _load_configured_scope(config_path) as scope:
+            result = await capture_scope_evidence(scope, parsed, output)
+            console.print(result["manifest"])
+
+    asyncio.run(capture())
+
+
+@scope_app.command("idn")
+def scope_idn(
+    config_path: Annotated[
+        Path | None,
+        typer.Option("--config", "-c", help="Path to scopeloop.yaml."),
+    ] = None,
+) -> None:
+    """Identify the configured oscilloscope."""
+
+    async def _idn() -> None:
+        scope = _load_configured_scope(config_path)
+        async with scope:
+            info = await scope.get_info()
+            console.print(f"{info.model} {info.serial or ''} {info.firmware_version or ''}".strip())
+            console.print(f"[dim]{info.address}[/dim]")
+
+    asyncio.run(_idn())
+
+
+@scope_app.command("query")
+def scope_query(
+    command: Annotated[str, typer.Argument(help="SCPI query to send.")],
+    config_path: Annotated[
+        Path | None,
+        typer.Option("--config", "-c", help="Path to scopeloop.yaml."),
+    ] = None,
+) -> None:
+    """Send a raw SCPI query to the configured oscilloscope."""
+
+    async def _query() -> None:
+        scope = _load_configured_scope(config_path)
+        async with scope:
+            console.print(await scope.query(command))
+
+    asyncio.run(_query())
+
+
+@scope_app.command("write")
+def scope_write(
+    command: Annotated[str, typer.Argument(help="SCPI command to send.")],
+    config_path: Annotated[
+        Path | None,
+        typer.Option("--config", "-c", help="Path to scopeloop.yaml."),
+    ] = None,
+) -> None:
+    """Send a raw SCPI command to the configured oscilloscope."""
+
+    async def _write() -> None:
+        scope = _load_configured_scope(config_path)
+        async with scope:
+            await scope.write(command)
+
+    asyncio.run(_write())
+    console.print("[green]ok[/green]")
+
+
+@scope_app.command("measure")
+def scope_measure(
+    measurement: Annotated[
+        str,
+        typer.Argument(
+            help="Snapshot measurement: frequency, period, vpp, vmax, vmin, vrms, "
+            "rise_time, fall_time, duty_cycle."
+        ),
+    ],
+    channel: Annotated[str, typer.Option("--channel", "-C", help="Channel to measure.")] = "CH1",
+    config_path: Annotated[
+        Path | None,
+        typer.Option("--config", "-c", help="Path to scopeloop.yaml."),
+    ] = None,
+) -> None:
+    """Take a built-in oscilloscope measurement."""
+
+    async def _measure() -> None:
+        scope = _load_configured_scope(config_path)
+        async with scope:
+            result = await scope.measure(channel, measurement)
+            console.print(
+                f"{result.measurement_type} {result.channel}: {result.value:g} {result.unit}"
+            )
+
+    asyncio.run(_measure())
+
+
+@scope_app.command("configure")
+def scope_configure(
+    channel: Annotated[
+        str,
+        typer.Option("--channel", "-C", help="Channel to configure."),
+    ] = "CH1",
+    scale: Annotated[
+        str | None,
+        typer.Option("--scale", help="Vertical scale, for example 1V or 500mV."),
+    ] = None,
+    timebase: Annotated[
+        str | None,
+        typer.Option("--timebase", help="Horizontal timebase, for example 1ms or 100us."),
+    ] = None,
+    trigger_level: Annotated[
+        float | None,
+        typer.Option("--trigger-level", help="Trigger level in volts."),
+    ] = None,
+    config_path: Annotated[
+        Path | None,
+        typer.Option("--config", "-c", help="Path to scopeloop.yaml."),
+    ] = None,
+) -> None:
+    """Configure basic oscilloscope channel, timebase, and trigger settings."""
+
+    async def _configure() -> None:
+        scope = _load_configured_scope(config_path)
+        async with scope:
+            if scale is not None:
+                await scope.set_channel_scale(channel, parse_si_value(scale))
+            if timebase is not None:
+                await scope.set_timebase(parse_si_value(timebase))
+            if trigger_level is not None:
+                await scope.set_trigger_level(trigger_level, source=channel)
+
+    asyncio.run(_configure())
+    console.print("[green]ok[/green]")
+
+
+@scope_app.command("status")
+def scope_status(
+    config_path: Annotated[
+        Path | None,
+        typer.Option("--config", "-c", help="Path to scopeloop.yaml."),
+    ] = None,
+) -> None:
+    """Show a compact oscilloscope status summary."""
+
+    async def _status() -> None:
+        scope = _load_configured_scope(config_path)
+        async with scope:
+            rows = [
+                ("idn", await scope.query("*IDN?")),
+                ("trigger_mode", await scope.query("TRMD?")),
+                ("timebase", await scope.query("TDIV?")),
+            ]
+            for channel in ("C1", "C2", "C3", "C4"):
+                rows.append((f"{channel}_scale", await scope.query(f"{channel}:VDIV?")))
+                rows.append((f"{channel}_offset", await scope.query(f"{channel}:OFST?")))
+
+            table = Table(show_header=True, header_style="bold")
+            table.add_column("Field")
+            table.add_column("Value")
+            for field, value in rows:
+                table.add_row(field, value)
+            console.print(table)
+
+    asyncio.run(_status())
+
+
+@scope_app.command("run")
+def scope_run(
+    config_path: Annotated[
+        Path | None,
+        typer.Option("--config", "-c", help="Path to scopeloop.yaml."),
+    ] = None,
+) -> None:
+    """Start oscilloscope acquisition."""
+
+    async def _run_scope() -> None:
+        scope = _load_configured_scope(config_path)
+        async with scope:
+            await scope.run()
+
+    asyncio.run(_run_scope())
+    console.print("[green]ok[/green]")
+
+
+@scope_app.command("stop")
+def scope_stop(
+    config_path: Annotated[
+        Path | None,
+        typer.Option("--config", "-c", help="Path to scopeloop.yaml."),
+    ] = None,
+) -> None:
+    """Stop oscilloscope acquisition."""
+
+    async def _stop() -> None:
+        scope = _load_configured_scope(config_path)
+        async with scope:
+            await scope.stop()
+
+    asyncio.run(_stop())
+    console.print("[green]ok[/green]")
+
+
+@scope_app.command("single")
+def scope_single(
+    config_path: Annotated[
+        Path | None,
+        typer.Option("--config", "-c", help="Path to scopeloop.yaml."),
+    ] = None,
+) -> None:
+    """Arm a single oscilloscope acquisition."""
+
+    async def _single() -> None:
+        scope = _load_configured_scope(config_path)
+        async with scope:
+            await scope.single()
+
+    asyncio.run(_single())
+    console.print("[green]ok[/green]")
+
+
+@scope_app.command("screenshot")
+def scope_screenshot(
+    output: Annotated[Path, typer.Argument(help="Output BMP path.")],
+    config_path: Annotated[
+        Path | None,
+        typer.Option("--config", "-c", help="Path to scopeloop.yaml."),
+    ] = None,
+) -> None:
+    """Save a screenshot from the oscilloscope display."""
+
+    async def _screenshot() -> None:
+        scope = _load_configured_scope(config_path)
+        async with scope:
+            output.write_bytes(await scope.screenshot())
+
+    asyncio.run(_screenshot())
+    console.print(f"[green]saved[/green] {output}")
 
 
 # ============================================================================
@@ -569,6 +848,7 @@ def logic_connect(
 @logic_app.command("capture")
 def logic_capture(
     recipe: Annotated[str, typer.Option("--recipe", "-r", help="Configured recipe name.")],
+    native_labels: Annotated[bool, typer.Option("--native-labels")] = False,
     metadata: Annotated[
         list[str] | None,
         typer.Option("--metadata", "-m", help="Required or optional key=value run metadata."),
@@ -592,6 +872,7 @@ def logic_capture(
                 recipe,
                 parse_metadata(metadata or []),
                 root,
+                **({"native_labels": True} if native_labels else {}),
             )
             return bundle.to_dict()
         finally:

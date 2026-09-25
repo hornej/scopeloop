@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from scopeloop.instruments.base import Instrument, InstrumentError, InstrumentInfo
+from scopeloop.resources import HostLease, TaskRLock, serialized
 
 logger = logging.getLogger(__name__)
 
@@ -190,6 +191,8 @@ class SaleaeLogicAnalyzer(Instrument):
                 "Saleae automation not available. Install with: pip install logic2-automation"
             )
 
+        self._lock = TaskRLock()
+        self._lease = HostLease(f"saleae:127.0.0.1:{port}")
         self.port = port
         self.device_id = device_id
         self.launch = launch
@@ -203,6 +206,7 @@ class SaleaeLogicAnalyzer(Instrument):
     def is_connected(self) -> bool:
         return self._connected
 
+    @serialized
     async def connect(self) -> None:
         """Connect to Logic 2 application."""
         if self._connected:
@@ -210,6 +214,7 @@ class SaleaeLogicAnalyzer(Instrument):
 
         logger.info(f"Connecting to Saleae Logic 2 on port {self.port}")
 
+        self._lease.acquire()
         try:
             # Run connection in thread pool since it's blocking
             loop = asyncio.get_event_loop()
@@ -218,7 +223,7 @@ class SaleaeLogicAnalyzer(Instrument):
                 self._manager = await loop.run_in_executor(None, Manager.launch)
             else:
                 self._manager = await loop.run_in_executor(
-                    None, lambda: Manager.connect(port=self.port)
+                    None, lambda: Manager.connect(port=self.port, connect_timeout_seconds=10)
                 )
 
             # Get devices
@@ -239,6 +244,10 @@ class SaleaeLogicAnalyzer(Instrument):
                         f"Available: {[d.device_id for d in devices]}"
                     )
             else:
+                if len(devices) != 1 or devices[0].is_simulation:
+                    raise InstrumentError(
+                        "Select a stable Saleae device_id; device is ambiguous/simulated"
+                    )
                 self._device = devices[0]
 
             self._connected = True
@@ -246,11 +255,15 @@ class SaleaeLogicAnalyzer(Instrument):
                 f"Connected to Saleae {self._device.device_type} (ID: {self._device.device_id})"
             )
 
-        except Exception as e:
+        except BaseException as e:
+            if self._manager:
+                await asyncio.to_thread(self._manager.close)
+            self._lease.release()
             self._connected = False
             self._manager = None
             raise InstrumentError(f"Failed to connect to Saleae: {e}") from e
 
+    @serialized
     async def disconnect(self) -> None:
         """Disconnect from Logic 2."""
         if not self._connected:
@@ -268,7 +281,9 @@ class SaleaeLogicAnalyzer(Instrument):
         self._manager = None
         self._device = None
         self._connected = False
+        self._lease.release()
 
+    @serialized
     async def get_info(self) -> InstrumentInfo:
         """Get device information."""
         if not self._device:
@@ -286,6 +301,7 @@ class SaleaeLogicAnalyzer(Instrument):
             address=f"localhost:{self.port}",
         )
 
+    @serialized
     async def list_devices(self) -> list[dict[str, Any]]:
         """List connected Saleae devices.
 
@@ -307,6 +323,7 @@ class SaleaeLogicAnalyzer(Instrument):
             for d in devices
         ]
 
+    @serialized
     async def get_software_info(self) -> dict[str, Any]:
         """Return Logic 2 and automation API identity when exposed by the API."""
         result: dict[str, Any] = {
@@ -439,6 +456,7 @@ class SaleaeLogicAnalyzer(Instrument):
             await asyncio.wait({wait_future}, timeout=1.0)
         await wait_future
 
+    @serialized
     async def capture(
         self,
         duration: float,
@@ -556,6 +574,7 @@ class SaleaeLogicAnalyzer(Instrument):
             completed_at=completed_at,
         )
 
+    @serialized
     async def capture_with_trigger(
         self,
         digital_channels: list[int],
@@ -700,6 +719,7 @@ class SaleaeLogicAnalyzer(Instrument):
             },
         )
 
+    @serialized
     async def add_analyzer(
         self,
         capture: CaptureResult,
@@ -745,6 +765,7 @@ class SaleaeLogicAnalyzer(Instrument):
             _analyzer=analyzer,
         )
 
+    @serialized
     async def export_analyzer_csv(
         self,
         capture: CaptureResult,
@@ -787,6 +808,7 @@ class SaleaeLogicAnalyzer(Instrument):
         await loop.run_in_executor(None, do_export)
         logger.info(f"Exported analyzer data to {output_path}")
 
+    @serialized
     async def export_raw_csv(
         self,
         capture: CaptureResult,
@@ -828,6 +850,7 @@ class SaleaeLogicAnalyzer(Instrument):
         logger.info("Exported raw data to %s", output_dir)
         return paths
 
+    @serialized
     async def save_capture(self, capture: CaptureResult, output_path: Path) -> None:
         """Save capture to a .sal file.
 
@@ -847,11 +870,13 @@ class SaleaeLogicAnalyzer(Instrument):
         await loop.run_in_executor(None, do_save)
         logger.info(f"Saved capture to {output_path}")
 
+    @serialized
     async def close_capture(self, capture: CaptureResult) -> None:
         """Close a Logic capture tab and release its memory."""
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, capture._capture.close)
 
+    @serialized
     async def load_capture(self, capture_path: Path) -> CaptureResult:
         """Load a previously saved capture.
 
@@ -881,6 +906,7 @@ class SaleaeLogicAnalyzer(Instrument):
             _capture=capture,
         )
 
+    @serialized
     async def get_analyzer_data(
         self,
         capture: CaptureResult,

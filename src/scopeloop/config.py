@@ -15,6 +15,7 @@ class DeviceMatch(BaseModel):
     vid: str | None = None  # Vendor ID (e.g., "0x10c4")
     pid: str | None = None  # Product ID (e.g., "0xea60")
     serial: str | None = None  # Device serial number (optional)
+    by_id: str | None = None  # Stable Linux /dev/serial/by-id path
 
 
 class DeviceConfig(BaseModel):
