@@ -22,11 +22,12 @@ class MeasurementResult:
     """Result of a measurement computation."""
 
     measurement_type: str
-    value: float
+    value: float | None
     unit: str
     confidence: float = 1.0  # 0-1, how confident we are in this measurement
     method: str = ""  # Method used (e.g., "zero_crossing", "fft")
-    details: dict = None  # Additional details
+    details: dict | None = None  # Additional details
+    status: str = "valid"
 
     def __post_init__(self):
         if self.details is None:
@@ -40,6 +41,7 @@ class MeasurementResult:
             "confidence": self.confidence,
             "method": self.method,
             "details": self.details,
+            "status": self.status,
         }
 
 
@@ -68,27 +70,115 @@ class MeasurementEngine:
         samples: np.ndarray,
         sample_rate: float,
         method: Literal["zero_crossing", "fft", "auto"] = "auto",
+        signal_type: Literal["periodic", "clock", "logic", "uart"] = "periodic",
+        logic_low_max_v: float | None = None,
+        logic_high_min_v: float | None = None,
+        min_peak_to_peak_v: float = 0.05,
+        min_cycles: int = 3,
+        max_period_cv: float = 0.2,
     ) -> MeasurementResult:
-        """Compute signal frequency.
+        """Compute frequency only after amplitude, electrical, and edge checks."""
+        samples = np.asarray(samples, dtype=float)
+        if (
+            not np.isfinite(sample_rate)
+            or sample_rate <= 0
+            or len(samples) < 4
+            or not np.all(np.isfinite(samples))
+        ):
+            return self._invalid_frequency(
+                method,
+                "insufficient_data",
+                "Samples must be finite and sample_rate must be finite and positive",
+            )
 
-        Args:
-            samples: Waveform samples.
-            sample_rate: Sample rate in Hz.
-            method: Method to use - "zero_crossing", "fft", or "auto".
+        low_percentile, high_percentile = np.percentile(samples, [5, 95])
+        robust_vpp = float(high_percentile - low_percentile)
+        if robust_vpp < min_peak_to_peak_v:
+            return self._invalid_frequency(
+                method,
+                "insufficient_amplitude",
+                f"Robust peak-to-peak amplitude {robust_vpp:.6g} V is below the minimum",
+                {
+                    "robust_peak_to_peak_v": robust_vpp,
+                    "minimum_peak_to_peak_v": min_peak_to_peak_v,
+                },
+            )
 
-        Returns:
-            Measurement result with frequency in Hz.
-        """
+        if signal_type in {"clock", "logic", "uart"}:
+            if logic_low_max_v is None or logic_high_min_v is None:
+                return self._invalid_frequency(
+                    method,
+                    "indeterminate_logic_levels",
+                    "Logic frequency requires guaranteed low and high limits",
+                )
+            if low_percentile > logic_low_max_v or high_percentile < logic_high_min_v:
+                return self._invalid_frequency(
+                    method,
+                    "indeterminate_logic_levels",
+                    "Signal does not make valid low and high electrical excursions",
+                    {
+                        "low_percentile_v": float(low_percentile),
+                        "high_percentile_v": float(high_percentile),
+                        "logic_low_max_v": logic_low_max_v,
+                        "logic_high_min_v": logic_high_min_v,
+                    },
+                )
+
         if method == "auto":
-            # Use zero-crossing for clean signals, FFT for noisy ones
             method = "zero_crossing"
 
         if method == "zero_crossing":
-            return self._frequency_zero_crossing(samples, sample_rate)
+            result = self._frequency_zero_crossing(samples, sample_rate)
         elif method == "fft":
-            return self._frequency_fft(samples, sample_rate)
+            result = self._frequency_fft(samples, sample_rate)
         else:
             raise ValueError(f"Unknown method: {method}")
+
+        result.details.update({"signal_type": signal_type, "robust_peak_to_peak_v": robust_vpp})
+        if result.value is None:
+            return result
+        if result.method == "zero_crossing":
+            cycles = int(result.details.get("periods_measured", 0))
+            period_cv = float(result.details.get("period_cv", float("inf")))
+            if cycles < min_cycles:
+                return self._invalid_frequency(
+                    result.method,
+                    "insufficient_edges",
+                    f"Only {cycles} cycles were measured; {min_cycles} are required",
+                    result.details,
+                )
+            if period_cv > max_period_cv:
+                return self._invalid_frequency(
+                    result.method,
+                    "poor_edge_quality",
+                    f"Period coefficient of variation {period_cv:.3f} exceeds the limit",
+                    result.details,
+                )
+        elif result.confidence < 0.5:
+            return self._invalid_frequency(
+                result.method,
+                "poor_spectral_quality",
+                "No sufficiently prominent periodic component was found",
+                result.details,
+            )
+        return result
+
+    @staticmethod
+    def _invalid_frequency(
+        method: str,
+        status: str,
+        reason: str,
+        details: dict | None = None,
+    ) -> MeasurementResult:
+        return MeasurementResult(
+            measurement_type="frequency",
+            value=None,
+            unit="Hz",
+            confidence=0.0,
+            method=method,
+            details={"reason": reason, **(details or {})},
+            status=status,
+        )
 
     def _frequency_zero_crossing(
         self,
@@ -105,11 +195,12 @@ class MeasurementEngine:
         if len(zero_crossings) < 2:
             return MeasurementResult(
                 measurement_type="frequency",
-                value=0.0,
+                value=None,
                 unit="Hz",
                 confidence=0.0,
                 method="zero_crossing",
-                details={"error": "Insufficient zero crossings"},
+                details={"reason": "Insufficient zero crossings"},
+                status="insufficient_edges",
             )
 
         # Calculate periods between crossings
@@ -119,7 +210,7 @@ class MeasurementEngine:
         if len(periods) == 0:
             return MeasurementResult(
                 measurement_type="frequency",
-                value=0.0,
+                value=None,
                 unit="Hz",
                 confidence=0.0,
                 method="zero_crossing",
@@ -136,6 +227,7 @@ class MeasurementEngine:
         else:
             confidence = 0.5
 
+        period_std = float(np.std(periods)) if len(periods) > 1 else 0.0
         return MeasurementResult(
             measurement_type="frequency",
             value=float(frequency),
@@ -144,7 +236,8 @@ class MeasurementEngine:
             method="zero_crossing",
             details={
                 "periods_measured": len(periods),
-                "period_std": float(np.std(periods)) if len(periods) > 1 else 0,
+                "period_std": period_std,
+                "period_cv": period_std / float(avg_period) if avg_period else float("inf"),
             },
         )
 
@@ -154,8 +247,8 @@ class MeasurementEngine:
         sample_rate: float,
     ) -> MeasurementResult:
         """Compute frequency using FFT."""
-        # Apply window to reduce spectral leakage
-        windowed = samples * signal.windows.hann(len(samples))
+        # Remove DC before windowing so offset does not leak into low-frequency bins.
+        windowed = (samples - np.mean(samples)) * signal.windows.hann(len(samples))
 
         # Compute FFT
         n = len(samples)
@@ -170,7 +263,7 @@ class MeasurementEngine:
         if len(fft_magnitude) == 0:
             return MeasurementResult(
                 measurement_type="frequency",
-                value=0.0,
+                value=None,
                 unit="Hz",
                 confidence=0.0,
                 method="fft",
@@ -205,13 +298,15 @@ class MeasurementEngine:
         """Compute signal period."""
         freq_result = self.frequency(samples, sample_rate)
 
-        if freq_result.value == 0 or freq_result.confidence == 0:
+        if freq_result.value is None or freq_result.confidence == 0:
             return MeasurementResult(
                 measurement_type="period",
-                value=0.0,
+                value=None,
                 unit="s",
                 confidence=0.0,
                 method=freq_result.method,
+                details=freq_result.details,
+                status=freq_result.status,
             )
 
         period = 1.0 / freq_result.value

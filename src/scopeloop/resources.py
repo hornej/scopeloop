@@ -12,17 +12,108 @@ access the same hardware simultaneously.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
+import os
 import time
 import uuid
+from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, AsyncIterator, Callable, Coroutine, TypeVar
+from functools import wraps
+from pathlib import Path
+from typing import Any, TypeVar
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+
+class TaskRLock:
+    """Serialize complete workflows; nesting is allowed only in the owning task."""
+
+    def __init__(self):
+        self._lock = asyncio.Lock()
+        self._owner = None
+        self._depth = 0
+
+    async def __aenter__(self):
+        task = asyncio.current_task()
+        if self._owner is not task:
+            await self._lock.acquire()
+            self._owner = task
+        self._depth += 1
+        return self
+
+    async def __aexit__(self, *args):
+        self._depth -= 1
+        if not self._depth:
+            self._owner = None
+            self._lock.release()
+
+
+def serialized(method):
+    """Use the same task lock for a driver operation and its nested transactions."""
+
+    @wraps(method)
+    async def wrapper(self, *args, **kwargs):
+        async with self._lock:
+            return await method(self, *args, **kwargs)
+
+    return wrapper
+
+
+class HostLease:
+    """Fail-fast OS lease shared by ScopeLoop processes, released on process exit.
+
+    All clients of a shared host must use the same SCOPELOOP_LOCK_DIR. This does
+    not arbitrate raw third-party sockets or front-panel operations.
+    """
+
+    def __init__(self, key: str, directory: Path | None = None):
+        self.key = key
+        root = directory or Path(os.environ.get("SCOPELOOP_LOCK_DIR", "~/.scopeloop/locks"))
+        self.path = root.expanduser() / (hashlib.sha256(key.encode()).hexdigest() + ".lock")
+        self._file = None
+
+    def acquire(self):
+        if self._file is not None:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self.path.open("a+b")
+        handle.seek(0, 2)
+        if handle.tell() == 0:
+            handle.write(b" ")
+            handle.flush()
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            handle.close()
+            raise ResourceError(f"Resource busy: {self.key}; lease {self.path}") from exc
+        self._file = handle
+        handle.seek(1)
+        handle.truncate()
+        handle.write(
+            json.dumps(
+                {"pid": os.getpid(), "resource": self.key, "acquired_at": time.time()}
+            ).encode()
+        )
+        handle.flush()
+
+    def release(self):
+        if self._file is not None:
+            self._file.close()
+            self._file = None
 
 
 class ResourceState(Enum):
@@ -38,8 +129,8 @@ class LockMode(Enum):
     """Lock acquisition mode."""
 
     EXCLUSIVE = "exclusive"  # Full read/write access
-    OBSERVE = "observe"  # Read-only, doesn't block exclusive
-    CONTROL_TRANSFER = "control_transfer"  # Request exclusive, pausing current owner
+    OBSERVE = "observe"  # Instrument reads also serialize; use cached state for observers
+    CONTROL_TRANSFER = "control_transfer"  # Wait for explicit release; never preempt
 
 
 class ClientPriority(Enum):
@@ -60,6 +151,8 @@ class LockInfo:
     priority: ClientPriority
     acquired_at: float
     timeout: float | None = None
+    task: Any = None
+    depth: int = 1
 
 
 @dataclass
@@ -84,12 +177,14 @@ class ResourceLock:
         client_id: str,
         mode: LockMode,
         priority: ClientPriority,
+        timeout: float | None = None,
     ):
         self._manager = manager
         self._resource_id = resource_id
         self._client_id = client_id
         self._mode = mode
         self._priority = priority
+        self._timeout = timeout
         self._acquired = False
 
     async def __aenter__(self) -> ResourceLock:
@@ -98,6 +193,7 @@ class ResourceLock:
             self._client_id,
             self._mode,
             self._priority,
+            self._timeout,
         )
         self._acquired = True
         return self
@@ -201,6 +297,9 @@ class ResourceManager:
         if resource_id not in self._resources:
             raise ResourceNotFoundError(f"Unknown resource: {resource_id}")
 
+        owner = self._locks[resource_id]
+        if owner is not None and owner.task is not asyncio.current_task():
+            raise ResourceError(f"Resource busy: {resource_id} ({owner.client_id})")
         resource = self._resources[resource_id]
         if resource.state == ResourceState.CONNECTED:
             await self.disconnect(resource_id)
@@ -226,10 +325,15 @@ class ResourceManager:
         if resource_id not in self._resources:
             raise ResourceNotFoundError(f"Unknown resource: {resource_id}")
 
+        owner = self._locks[resource_id]
+        if owner is not None and owner.task is not asyncio.current_task():
+            raise ResourceError(f"Resource busy: {resource_id} ({owner.client_id})")
         resource = self._resources[resource_id]
         if resource.state == ResourceState.CONNECTED:
             return resource.connection
 
+        if resource.state == ResourceState.CONNECTING:
+            raise ResourceError(f"Resource connection already in progress: {resource_id}")
         resource.state = ResourceState.CONNECTING
         self._emit_event("resource_connecting", resource_id, {})
 
@@ -253,6 +357,9 @@ class ResourceManager:
         if resource_id not in self._resources:
             raise ResourceNotFoundError(f"Unknown resource: {resource_id}")
 
+        owner = self._locks[resource_id]
+        if owner is not None and owner.task is not asyncio.current_task():
+            raise ResourceError(f"Resource busy: {resource_id} ({owner.client_id})")
         resource = self._resources[resource_id]
         if resource.state != ResourceState.CONNECTED:
             return
@@ -288,7 +395,7 @@ class ResourceManager:
         Yields:
             A ResourceLock context manager.
         """
-        lock = ResourceLock(self, resource_id, client_id, mode, priority)
+        lock = ResourceLock(self, resource_id, client_id, mode, priority, timeout)
         try:
             await lock.__aenter__()
             yield lock
@@ -307,7 +414,7 @@ class ResourceManager:
         if resource_id not in self._resources:
             raise ResourceNotFoundError(f"Unknown resource: {resource_id}")
 
-        timeout = timeout or self._default_lock_timeout
+        timeout = self._default_lock_timeout if timeout is None else timeout
         condition = self._lock_conditions[resource_id]
 
         async with condition:
@@ -325,6 +432,7 @@ class ResourceManager:
                         priority=priority,
                         acquired_at=time.time(),
                         timeout=timeout,
+                        task=asyncio.current_task(),
                     )
                     logger.debug(f"Lock acquired: {resource_id} by {client_id}")
                     self._emit_event(
@@ -334,40 +442,12 @@ class ResourceManager:
                     )
                     return
 
-                # Observe mode doesn't block on exclusive locks
-                if mode == LockMode.OBSERVE and current_lock.mode == LockMode.EXCLUSIVE:
-                    # Observe is allowed alongside exclusive
-                    logger.debug(f"Observe mode granted: {resource_id} to {client_id}")
-                    return
-
-                # Same client already holds the lock
-                if current_lock.client_id == client_id:
-                    logger.debug(f"Lock already held by same client: {resource_id}")
-                    return
-
-                # Higher priority can preempt
-                if priority.value > current_lock.priority.value:
-                    logger.info(
-                        f"Preempting lock on {resource_id}: {current_lock.client_id} "
-                        f"({current_lock.priority}) -> {client_id} ({priority})"
-                    )
-                    self._emit_event(
-                        "lock_preempted",
-                        resource_id,
-                        {
-                            "old_client": current_lock.client_id,
-                            "new_client": client_id,
-                        },
-                    )
-                    self._locks[resource_id] = LockInfo(
-                        resource_id=resource_id,
-                        client_id=client_id,
-                        mode=mode,
-                        priority=priority,
-                        acquired_at=time.time(),
-                        timeout=timeout,
-                    )
-                    condition.notify_all()
+                # Priority and OBSERVE never grant access to another active owner.
+                if (
+                    current_lock.client_id == client_id
+                    and current_lock.task is asyncio.current_task()
+                ):
+                    current_lock.depth += 1
                     return
 
                 # Wait for lock to be released
@@ -381,11 +461,11 @@ class ResourceManager:
 
                 try:
                     await asyncio.wait_for(condition.wait(), timeout=remaining)
-                except asyncio.TimeoutError:
+                except TimeoutError as exc:
                     raise LockTimeoutError(
                         f"Timeout acquiring lock on {resource_id} "
                         f"(held by {current_lock.client_id})"
-                    )
+                    ) from exc
 
     async def _release_lock(self, resource_id: str, client_id: str) -> None:
         """Internal: Release a lock on a resource."""
@@ -396,7 +476,14 @@ class ResourceManager:
 
         async with condition:
             current_lock = self._locks[resource_id]
-            if current_lock is not None and current_lock.client_id == client_id:
+            if (
+                current_lock is not None
+                and current_lock.client_id == client_id
+                and current_lock.task is asyncio.current_task()
+            ):
+                current_lock.depth -= 1
+                if current_lock.depth:
+                    return
                 self._locks[resource_id] = None
                 logger.debug(f"Lock released: {resource_id} by {client_id}")
                 self._emit_event(
@@ -478,6 +565,8 @@ class ResourceManager:
 
     async def shutdown(self) -> None:
         """Disconnect all resources and shutdown the manager."""
+        if any(self._locks.values()):
+            raise ResourceError("Cannot shut down while resources are owned")
         logger.info("Shutting down ResourceManager...")
         for resource_id in list(self._resources.keys()):
             try:

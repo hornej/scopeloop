@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, Any
 
 import typer
 from rich.console import Console
@@ -12,10 +13,19 @@ from rich.panel import Panel
 from rich.table import Table
 
 from scopeloop import __version__
-from scopeloop.config import Config, create_default_config, load_config
+from scopeloop.comparison import compare_bundles
+from scopeloop.config import (
+    Config,
+    LogicUartAnalyzerConfig,
+    create_default_config,
+    load_config,
+)
 from scopeloop.devices import DeviceManager, DeviceMatch
 from scopeloop.host import collect_host_status, format_bytes
+from scopeloop.instruments.base import InstrumentError
+from scopeloop.logic import LogicCaptureService, parse_metadata
 from scopeloop.safety import GuardrailType, SafetyConfig, SafetyGuardrails
+from scopeloop.scope import ScopeConfigError, create_scope_from_config, parse_si_value
 from scopeloop.session import SessionManager
 
 app = typer.Typer(
@@ -66,16 +76,15 @@ def init(
         typer.Option("--mcu", "-m", help="Target MCU type."),
     ] = "esp32",
     output: Annotated[
-        Optional[Path],
+        Path | None,
         typer.Option("--output", "-o", help="Output path for config file."),
     ] = None,
 ) -> None:
     """Initialize a new ScopeLoop project with a scopeloop.yaml config file."""
     output_path = output or Path("scopeloop.yaml")
 
-    if output_path.exists():
-        if not typer.confirm(f"{output_path} already exists. Overwrite?"):
-            raise typer.Exit(1)
+    if output_path.exists() and not typer.confirm(f"{output_path} already exists. Overwrite?"):
+        raise typer.Exit(1)
 
     config_path = create_default_config(project_name, mcu, output_path)
     console.print(f"[green]Created[/green] {config_path}")
@@ -90,7 +99,7 @@ def init(
 @app.command()
 def status(
     config_path: Annotated[
-        Optional[Path],
+        Path | None,
         typer.Option("--config", "-c", help="Path to scopeloop.yaml."),
     ] = None,
 ) -> None:
@@ -100,7 +109,7 @@ def status(
     except FileNotFoundError:
         console.print("[yellow]No scopeloop.yaml found.[/yellow]")
         console.print("Run [bold]scopeloop init <project-name>[/bold] to create one.")
-        raise typer.Exit(1)
+        raise typer.Exit(1) from None
 
     # Project info panel
     project_info = Table.grid(padding=(0, 2))
@@ -120,7 +129,7 @@ def status(
         devices_table.add_column("VID:PID")
         devices_table.add_column("Status")
 
-        for name, device in config.devices.items():
+        for _name, device in config.devices.items():
             vid_pid = f"{device.match.vid or '?'}:{device.match.pid or '?'}"
             # Try to find actual port
             status = "[yellow]Not checked[/yellow]"
@@ -131,13 +140,10 @@ def status(
     # Instruments panel
     instruments_info = []
     if config.instruments.oscilloscope:
-        instruments_info.append(
-            f"Oscilloscope: {config.instruments.oscilloscope.type} @ {config.instruments.oscilloscope.address}"
-        )
+        scope = config.instruments.oscilloscope
+        instruments_info.append(f"Oscilloscope: {scope.type} @ {scope.address}")
     if config.instruments.logic_analyzer:
-        instruments_info.append(
-            f"Logic Analyzer: {config.instruments.logic_analyzer.type}"
-        )
+        instruments_info.append(f"Logic Analyzer: {config.instruments.logic_analyzer.type}")
 
     if instruments_info:
         console.print(Panel("\n".join(instruments_info), title="Instruments"))
@@ -157,9 +163,7 @@ def status(
                 capability.name for capability in module.manifest.capabilities[:3]
             )
             if len(module.manifest.capabilities) > 3:
-                capabilities = (
-                    f"{capabilities}, +{len(module.manifest.capabilities) - 3} more"
-                )
+                capabilities = f"{capabilities}, +{len(module.manifest.capabilities) - 3} more"
             modules_table.add_row(
                 name,
                 module.slot,
@@ -184,9 +188,7 @@ def status(
             if fixture.connection.path:
                 connection = f"{connection} ({fixture.connection.path})"
 
-            capabilities = ", ".join(
-                capability.name for capability in fixture.capabilities[:3]
-            )
+            capabilities = ", ".join(capability.name for capability in fixture.capabilities[:3])
             if len(fixture.capabilities) > 3:
                 capabilities = f"{capabilities}, +{len(fixture.capabilities) - 3} more"
             fixtures_table.add_row(name, fixture.type, connection, capabilities or "-")
@@ -243,15 +245,15 @@ def devices(
 @app.command("find-device")
 def find_device(
     vid: Annotated[
-        Optional[str],
+        str | None,
         typer.Option("--vid", help="Vendor ID to search for (e.g., 10c4 or 0x10c4)."),
     ] = None,
     pid: Annotated[
-        Optional[str],
+        str | None,
         typer.Option("--pid", help="Product ID to search for."),
     ] = None,
     serial: Annotated[
-        Optional[str],
+        str | None,
         typer.Option("--serial", "-s", help="Serial number to search for."),
     ] = None,
 ) -> None:
@@ -273,6 +275,292 @@ def find_device(
             console.print("[yellow]Device not found.[/yellow]")
 
     asyncio.run(_find())
+
+
+@app.command("usb-diagnostics")
+def usb_diagnostics() -> None:
+    """Read OS USB inventory and enumeration errors without device recovery actions."""
+    from scopeloop.usb import inventory
+
+    console.print_json(json.dumps(inventory()))
+
+
+@app.command("diagnose-device")
+def diagnose_device(
+    serial: Annotated[str | None, typer.Option("--serial")] = None,
+    by_id: Annotated[str | None, typer.Option("--by-id")] = None,
+    vid: Annotated[str | None, typer.Option("--vid")] = None,
+    pid: Annotated[str | None, typer.Option("--pid")] = None,
+) -> None:
+    """Report absent, ambiguous or failed enumeration without opening hardware."""
+    result = asyncio.run(
+        DeviceManager().diagnose(DeviceMatch(serial=serial, by_id=by_id, vid=vid, pid=pid))
+    )
+    console.print_json(json.dumps(result))
+
+
+# ============================================================================
+# Scope command
+# ============================================================================
+
+
+scope_app = typer.Typer(help="Control the configured oscilloscope.")
+app.add_typer(scope_app, name="scope")
+
+
+def _load_configured_scope(config_path: Path | None):
+    try:
+        config = load_config(config_path)
+        return create_scope_from_config(config)
+    except (FileNotFoundError, ScopeConfigError, ValueError) as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1) from e
+
+
+@scope_app.command("capture")
+def scope_capture(
+    recipe: Annotated[Path, typer.Argument(help="Scope evidence recipe JSON.")],
+    output: Annotated[Path, typer.Argument(help="New evidence directory.")],
+    config_path: Annotated[Path | None, typer.Option("--config", "-c")] = None,
+) -> None:
+    """Save a fresh ripple/noise-floor/load-step capture and its raw evidence."""
+    from scopeloop.scope_evidence import ScopeRecipe, capture_scope_evidence
+
+    parsed = ScopeRecipe.model_validate_json(recipe.read_text())
+
+    async def capture():
+        async with _load_configured_scope(config_path) as scope:
+            result = await capture_scope_evidence(scope, parsed, output)
+            console.print(result["manifest"])
+
+    asyncio.run(capture())
+
+
+@scope_app.command("idn")
+def scope_idn(
+    config_path: Annotated[
+        Path | None,
+        typer.Option("--config", "-c", help="Path to scopeloop.yaml."),
+    ] = None,
+) -> None:
+    """Identify the configured oscilloscope."""
+
+    async def _idn() -> None:
+        scope = _load_configured_scope(config_path)
+        async with scope:
+            info = await scope.get_info()
+            console.print(f"{info.model} {info.serial or ''} {info.firmware_version or ''}".strip())
+            console.print(f"[dim]{info.address}[/dim]")
+
+    asyncio.run(_idn())
+
+
+@scope_app.command("query")
+def scope_query(
+    command: Annotated[str, typer.Argument(help="SCPI query to send.")],
+    config_path: Annotated[
+        Path | None,
+        typer.Option("--config", "-c", help="Path to scopeloop.yaml."),
+    ] = None,
+) -> None:
+    """Send a raw SCPI query to the configured oscilloscope."""
+
+    async def _query() -> None:
+        scope = _load_configured_scope(config_path)
+        async with scope:
+            console.print(await scope.query(command))
+
+    asyncio.run(_query())
+
+
+@scope_app.command("write")
+def scope_write(
+    command: Annotated[str, typer.Argument(help="SCPI command to send.")],
+    config_path: Annotated[
+        Path | None,
+        typer.Option("--config", "-c", help="Path to scopeloop.yaml."),
+    ] = None,
+) -> None:
+    """Send a raw SCPI command to the configured oscilloscope."""
+
+    async def _write() -> None:
+        scope = _load_configured_scope(config_path)
+        async with scope:
+            await scope.write(command)
+
+    asyncio.run(_write())
+    console.print("[green]ok[/green]")
+
+
+@scope_app.command("measure")
+def scope_measure(
+    measurement: Annotated[
+        str,
+        typer.Argument(
+            help="Snapshot measurement: frequency, period, vpp, vmax, vmin, vrms, "
+            "rise_time, fall_time, duty_cycle."
+        ),
+    ],
+    channel: Annotated[str, typer.Option("--channel", "-C", help="Channel to measure.")] = "CH1",
+    config_path: Annotated[
+        Path | None,
+        typer.Option("--config", "-c", help="Path to scopeloop.yaml."),
+    ] = None,
+) -> None:
+    """Take a built-in oscilloscope measurement."""
+
+    async def _measure() -> None:
+        scope = _load_configured_scope(config_path)
+        async with scope:
+            result = await scope.measure(channel, measurement)
+            console.print(
+                f"{result.measurement_type} {result.channel}: {result.value:g} {result.unit}"
+            )
+
+    asyncio.run(_measure())
+
+
+@scope_app.command("configure")
+def scope_configure(
+    channel: Annotated[
+        str,
+        typer.Option("--channel", "-C", help="Channel to configure."),
+    ] = "CH1",
+    scale: Annotated[
+        str | None,
+        typer.Option("--scale", help="Vertical scale, for example 1V or 500mV."),
+    ] = None,
+    timebase: Annotated[
+        str | None,
+        typer.Option("--timebase", help="Horizontal timebase, for example 1ms or 100us."),
+    ] = None,
+    trigger_level: Annotated[
+        float | None,
+        typer.Option("--trigger-level", help="Trigger level in volts."),
+    ] = None,
+    config_path: Annotated[
+        Path | None,
+        typer.Option("--config", "-c", help="Path to scopeloop.yaml."),
+    ] = None,
+) -> None:
+    """Configure basic oscilloscope channel, timebase, and trigger settings."""
+
+    async def _configure() -> None:
+        scope = _load_configured_scope(config_path)
+        async with scope:
+            if scale is not None:
+                await scope.set_channel_scale(channel, parse_si_value(scale))
+            if timebase is not None:
+                await scope.set_timebase(parse_si_value(timebase))
+            if trigger_level is not None:
+                await scope.set_trigger_level(trigger_level, source=channel)
+
+    asyncio.run(_configure())
+    console.print("[green]ok[/green]")
+
+
+@scope_app.command("status")
+def scope_status(
+    config_path: Annotated[
+        Path | None,
+        typer.Option("--config", "-c", help="Path to scopeloop.yaml."),
+    ] = None,
+) -> None:
+    """Show a compact oscilloscope status summary."""
+
+    async def _status() -> None:
+        scope = _load_configured_scope(config_path)
+        async with scope:
+            rows = [
+                ("idn", await scope.query("*IDN?")),
+                ("trigger_mode", await scope.query("TRMD?")),
+                ("timebase", await scope.query("TDIV?")),
+            ]
+            for channel in ("C1", "C2", "C3", "C4"):
+                rows.append((f"{channel}_scale", await scope.query(f"{channel}:VDIV?")))
+                rows.append((f"{channel}_offset", await scope.query(f"{channel}:OFST?")))
+
+            table = Table(show_header=True, header_style="bold")
+            table.add_column("Field")
+            table.add_column("Value")
+            for field, value in rows:
+                table.add_row(field, value)
+            console.print(table)
+
+    asyncio.run(_status())
+
+
+@scope_app.command("run")
+def scope_run(
+    config_path: Annotated[
+        Path | None,
+        typer.Option("--config", "-c", help="Path to scopeloop.yaml."),
+    ] = None,
+) -> None:
+    """Start oscilloscope acquisition."""
+
+    async def _run_scope() -> None:
+        scope = _load_configured_scope(config_path)
+        async with scope:
+            await scope.run()
+
+    asyncio.run(_run_scope())
+    console.print("[green]ok[/green]")
+
+
+@scope_app.command("stop")
+def scope_stop(
+    config_path: Annotated[
+        Path | None,
+        typer.Option("--config", "-c", help="Path to scopeloop.yaml."),
+    ] = None,
+) -> None:
+    """Stop oscilloscope acquisition."""
+
+    async def _stop() -> None:
+        scope = _load_configured_scope(config_path)
+        async with scope:
+            await scope.stop()
+
+    asyncio.run(_stop())
+    console.print("[green]ok[/green]")
+
+
+@scope_app.command("single")
+def scope_single(
+    config_path: Annotated[
+        Path | None,
+        typer.Option("--config", "-c", help="Path to scopeloop.yaml."),
+    ] = None,
+) -> None:
+    """Arm a single oscilloscope acquisition."""
+
+    async def _single() -> None:
+        scope = _load_configured_scope(config_path)
+        async with scope:
+            await scope.single()
+
+    asyncio.run(_single())
+    console.print("[green]ok[/green]")
+
+
+@scope_app.command("screenshot")
+def scope_screenshot(
+    output: Annotated[Path, typer.Argument(help="Output BMP path.")],
+    config_path: Annotated[
+        Path | None,
+        typer.Option("--config", "-c", help="Path to scopeloop.yaml."),
+    ] = None,
+) -> None:
+    """Save a screenshot from the oscilloscope display."""
+
+    async def _screenshot() -> None:
+        scope = _load_configured_scope(config_path)
+        async with scope:
+            output.write_bytes(await scope.screenshot())
+
+    asyncio.run(_screenshot())
+    console.print(f"[green]saved[/green] {output}")
 
 
 # ============================================================================
@@ -356,7 +644,7 @@ def sessions_show(
             session = await manager.load_session(session_id)
         except FileNotFoundError:
             console.print(f"[red]Session not found:[/red] {session_id}")
-            raise typer.Exit(1)
+            raise typer.Exit(1) from None
 
         # Session info
         info = Table.grid(padding=(0, 2))
@@ -430,8 +718,10 @@ def safety_status() -> None:
 @safety_app.command("reset")
 def safety_reset(
     guardrail: Annotated[
-        Optional[str],
-        typer.Argument(help="Specific guardrail to reset (boot_loop, build_failure, flash_failure)."),
+        str | None,
+        typer.Argument(
+            help="Specific guardrail to reset (boot_loop, build_failure, flash_failure)."
+        ),
     ] = None,
 ) -> None:
     """Reset safety guardrails."""
@@ -440,10 +730,10 @@ def safety_reset(
     if guardrail:
         try:
             guardrail_type = GuardrailType(guardrail)
-        except ValueError:
+        except ValueError as exc:
             console.print(f"[red]Unknown guardrail:[/red] {guardrail}")
             console.print(f"Valid options: {', '.join(g.value for g in GuardrailType)}")
-            raise typer.Exit(1)
+            raise typer.Exit(1) from exc
         safety.reset(guardrail_type)
         console.print(f"[green]Reset guardrail:[/green] {guardrail}")
     else:
@@ -524,6 +814,224 @@ def host_status(
 
 
 # ============================================================================
+# Logic analyzer commands
+# ============================================================================
+
+
+logic_app = typer.Typer(help="Capture, decode, export, and compare logic evidence.")
+app.add_typer(logic_app, name="logic")
+
+
+def _logic_service(config_path: Path | None) -> tuple[Config, LogicCaptureService]:
+    config = load_config(config_path)
+    logic_config = config.instruments.logic_analyzer
+    if logic_config is None:
+        raise InstrumentError("No logic analyzer configured in scopeloop.yaml")
+    return config, LogicCaptureService(logic_config)
+
+
+@logic_app.command("connect")
+def logic_connect(
+    config_path: Annotated[
+        Path | None,
+        typer.Option("--config", "-c", help="Path to scopeloop.yaml."),
+    ] = None,
+) -> None:
+    """Connect to Logic 2 and report the selected device and software versions."""
+
+    async def run() -> dict:
+        _, service = _logic_service(config_path)
+        try:
+            return await service.connect()
+        finally:
+            await service.disconnect()
+
+    try:
+        console.print_json(json.dumps(asyncio.run(run()), indent=2))
+    except (FileNotFoundError, InstrumentError) as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+
+@logic_app.command("capture")
+def logic_capture(
+    recipe: Annotated[str, typer.Option("--recipe", "-r", help="Configured recipe name.")],
+    native_labels: Annotated[bool, typer.Option("--native-labels")] = False,
+    metadata: Annotated[
+        list[str] | None,
+        typer.Option("--metadata", "-m", help="Required or optional key=value run metadata."),
+    ] = None,
+    output_root: Annotated[
+        Path | None,
+        typer.Option("--output-root", "-o", help="Evidence bundle parent directory."),
+    ] = None,
+    config_path: Annotated[
+        Path | None,
+        typer.Option("--config", "-c", help="Path to scopeloop.yaml."),
+    ] = None,
+) -> None:
+    """Run a capture recipe and save a hashed evidence bundle automatically."""
+
+    async def run() -> dict:
+        config, service = _logic_service(config_path)
+        root = output_root or Path(config.runtime.data_dir).expanduser() / "captures"
+        try:
+            bundle = await service.capture_evidence(
+                recipe,
+                parse_metadata(metadata or []),
+                root,
+                **({"native_labels": True} if native_labels else {}),
+            )
+            return bundle.to_dict()
+        finally:
+            await service.disconnect(close_captures=True)
+
+    try:
+        console.print_json(json.dumps(asyncio.run(run()), indent=2))
+    except (FileNotFoundError, InstrumentError, ValueError) as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+
+async def _with_loaded_capture(
+    config_path: Path | None,
+    capture_path: Path,
+    action: Any,
+) -> Any:
+    _, service = _logic_service(config_path)
+    try:
+        capture = await service.load_capture(capture_path)
+        return await action(service, capture.capture_id)
+    finally:
+        await service.disconnect(close_captures=True)
+
+
+@logic_app.command("decode")
+def logic_decode(
+    capture_path: Annotated[Path, typer.Option("--capture", help="Source .sal capture.")],
+    output_path: Annotated[Path, typer.Option("--output", "-o", help="Decoded UART CSV.")],
+    channel: Annotated[int, typer.Option("--channel", help="UART input channel.")],
+    baud_rate: Annotated[int, typer.Option("--baud", help="UART baud rate.")] = 115200,
+    name: Annotated[str, typer.Option("--name", help="Analyzer label.")] = "uart",
+    config_path: Annotated[
+        Path | None,
+        typer.Option("--config", "-c", help="Path to scopeloop.yaml."),
+    ] = None,
+) -> None:
+    """Load a .sal capture, decode one UART channel, and export the decoder CSV."""
+    uart = LogicUartAnalyzerConfig(name=name, channel=channel, baud_rate=baud_rate)
+
+    async def action(service: LogicCaptureService, capture_id: str) -> str:
+        return str(await service.decode_uart(capture_id, uart, output_path))
+
+    try:
+        result = asyncio.run(_with_loaded_capture(config_path, capture_path, action))
+        console.print_json(json.dumps({"decoded_csv": result}, indent=2))
+    except (FileNotFoundError, InstrumentError, ValueError) as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+
+@logic_app.command("export")
+def logic_export(
+    capture_path: Annotated[Path, typer.Option("--capture", help="Source .sal capture.")],
+    output_dir: Annotated[Path, typer.Option("--output-dir", "-o", help="Raw CSV directory.")],
+    digital_channel: Annotated[
+        list[int] | None,
+        typer.Option("--digital-channel", help="Digital channel to export (repeatable)."),
+    ] = None,
+    analog_channel: Annotated[
+        list[int] | None,
+        typer.Option("--analog-channel", help="Analog channel to export (repeatable)."),
+    ] = None,
+    config_path: Annotated[
+        Path | None,
+        typer.Option("--config", "-c", help="Path to scopeloop.yaml."),
+    ] = None,
+) -> None:
+    """Load a .sal capture and export untouched Saleae raw CSV files."""
+
+    async def action(service: LogicCaptureService, capture_id: str) -> list[str]:
+        paths = await service.export_capture(
+            capture_id,
+            output_dir,
+            digital_channel,
+            analog_channel,
+        )
+        return [str(path) for path in paths]
+
+    try:
+        paths = asyncio.run(_with_loaded_capture(config_path, capture_path, action))
+        console.print_json(json.dumps({"raw_csv": paths}, indent=2))
+    except (FileNotFoundError, InstrumentError, ValueError) as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+
+@logic_app.command("save")
+def logic_save(
+    capture_path: Annotated[Path, typer.Option("--capture", help="Source .sal capture.")],
+    output_path: Annotated[Path, typer.Option("--output", "-o", help="Destination .sal.")],
+    config_path: Annotated[
+        Path | None,
+        typer.Option("--config", "-c", help="Path to scopeloop.yaml."),
+    ] = None,
+) -> None:
+    """Load and save a .sal copy through Logic 2, proving that Logic accepts it."""
+
+    async def action(service: LogicCaptureService, capture_id: str) -> str:
+        return str(await service.save_capture(capture_id, output_path))
+
+    try:
+        saved = asyncio.run(_with_loaded_capture(config_path, capture_path, action))
+        console.print_json(json.dumps({"saved_capture": saved}, indent=2))
+    except (FileNotFoundError, InstrumentError, ValueError) as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+
+@logic_app.command("compare")
+def logic_compare(
+    reference_bundle: Annotated[Path, typer.Option("--reference", help="Known-good bundle.")],
+    dut_bundle: Annotated[Path, typer.Option("--dut", help="DUT evidence bundle.")],
+    align_channel: Annotated[int, typer.Option("--align-channel", help="Alignment channel.")],
+    signal: Annotated[
+        list[int] | None,
+        typer.Option("--signal", help="Channel to compare (repeatable; default all)."),
+    ] = None,
+    edge: Annotated[str, typer.Option("--edge", help="rising or falling.")] = "rising",
+    threshold_v: Annotated[
+        float | None,
+        typer.Option("--threshold", help="Alignment threshold; default robust midpoint."),
+    ] = None,
+    output_path: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Write comparison JSON."),
+    ] = None,
+) -> None:
+    """Compare a DUT with a known-good capture under identical recipe settings."""
+    if edge not in {"rising", "falling"}:
+        raise typer.BadParameter("edge must be rising or falling")
+    try:
+        result = compare_bundles(
+            reference_bundle,
+            dut_bundle,
+            align_channel,
+            edge,
+            threshold_v,
+            signal,
+        )
+        content = json.dumps(result, indent=2) + "\n"
+        if output_path:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(content, encoding="utf-8")
+        console.print_json(content)
+    except (FileNotFoundError, ValueError) as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+
+# ============================================================================
 # Config command
 # ============================================================================
 
@@ -531,7 +1039,7 @@ def host_status(
 @app.command("config")
 def show_config(
     config_path: Annotated[
-        Optional[Path],
+        Path | None,
         typer.Option("--config", "-c", help="Path to scopeloop.yaml."),
     ] = None,
 ) -> None:
@@ -540,7 +1048,7 @@ def show_config(
         config = load_config(config_path)
     except FileNotFoundError as e:
         console.print(f"[red]Error:[/red] {e}")
-        raise typer.Exit(1)
+        raise typer.Exit(1) from e
 
     import json
 
@@ -548,8 +1056,31 @@ def show_config(
 
 
 # ============================================================================
-# Entry point
+# Saved evidence viewers
 # ============================================================================
+
+evidence_app = typer.Typer(help="Export saved evidence to ngscopeclient and PulseView.")
+app.add_typer(evidence_app, name="evidence")
+
+
+@evidence_app.command("export")
+def evidence_export(
+    bundle: Path,
+    output: Path,
+    max_samples: Annotated[
+        int, typer.Option(min=2, help="Maximum expanded samples per stream.")
+    ] = 50_000_000,
+) -> None:
+    """Verify a completed bundle and create offline viewer files in a new directory."""
+    from scopeloop.viewers import export_viewers
+
+    try:
+        result = export_viewers(bundle, output, max_samples)
+    except (OSError, ValueError, KeyError) as exc:
+        typer.echo(f"Export failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(json.dumps(result, indent=2))
+
 
 if __name__ == "__main__":
     app()

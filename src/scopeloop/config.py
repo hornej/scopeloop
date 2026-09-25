@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class DeviceMatch(BaseModel):
@@ -15,6 +15,7 @@ class DeviceMatch(BaseModel):
     vid: str | None = None  # Vendor ID (e.g., "0x10c4")
     pid: str | None = None  # Product ID (e.g., "0xea60")
     serial: str | None = None  # Device serial number (optional)
+    by_id: str | None = None  # Stable Linux /dev/serial/by-id path
 
 
 class DeviceConfig(BaseModel):
@@ -40,6 +41,7 @@ class OscilloscopeConfig(BaseModel):
     driver: str | None = None  # sigrok driver name (e.g., "siglent-sds")
     address: str | None = None  # IP address for network devices
     connection: str | None = None  # sigrok connection string
+    expected_serial: str | None = None
     probes: dict[str, ProbeConfig] = Field(default_factory=dict)
 
 
@@ -48,6 +50,115 @@ class LogicChannelConfig(BaseModel):
 
     signal: str
     label: str | None = None
+    signal_type: Literal[
+        "unknown", "analog", "logic", "clock", "rail", "reset", "strap", "uart"
+    ] = "unknown"
+    digital: bool = True
+    analog: bool = False
+    requested_measurements: list[str] = Field(default_factory=list)
+    electrical: LogicElectricalLimitsConfig | None = None
+
+
+class LogicElectricalLimitsConfig(BaseModel):
+    """Guaranteed electrical regions for interpreting an analog logic signal."""
+
+    input_low_max_v: float | None = None
+    input_high_min_v: float | None = None
+    output_low_max_v: float | None = None
+    output_high_min_v: float | None = None
+
+    @model_validator(mode="after")
+    def validate_regions(self) -> LogicElectricalLimitsConfig:
+        if (
+            self.input_low_max_v is not None
+            and self.input_high_min_v is not None
+            and self.input_low_max_v >= self.input_high_min_v
+        ):
+            raise ValueError("input_low_max_v must be below input_high_min_v")
+        if (
+            self.output_low_max_v is not None
+            and self.output_high_min_v is not None
+            and self.output_low_max_v >= self.output_high_min_v
+        ):
+            raise ValueError("output_low_max_v must be below output_high_min_v")
+        return self
+
+
+class LogicTriggerConfig(BaseModel):
+    """Edge-triggered capture window and bounded arm time."""
+
+    channel: int = Field(ge=0)
+    edge: Literal["rising", "falling"] = "rising"
+    pre_trigger_seconds: float = Field(default=0.0, ge=0)
+    post_trigger_seconds: float = Field(default=1.0, gt=0)
+    timeout_seconds: float = Field(default=30.0, gt=0)
+
+
+class LogicUartAnalyzerConfig(BaseModel):
+    """Saleae Async Serial analyzer configuration."""
+
+    name: str
+    channel: int = Field(ge=0)
+    baud_rate: int = Field(default=115200, gt=0)
+    bits_per_frame: int = Field(default=8, ge=5, le=9)
+    stop_bits: Literal[1.0, 1.5, 2.0] = 1.0
+    parity: Literal["None", "Even", "Odd"] = "None"
+    bit_order: Literal["least_significant_first", "most_significant_first"] = (
+        "least_significant_first"
+    )
+    inverted: bool = False
+    radix: Literal["hexadecimal", "decimal", "binary", "ascii"] = "hexadecimal"
+
+
+class LogicComparisonConfig(BaseModel):
+    """Default alignment and signal selection for reference comparisons."""
+
+    align_channel: int = Field(ge=0)
+    edge: Literal["rising", "falling"] = "rising"
+    threshold_v: float | None = None
+    signals: list[int] = Field(default_factory=list)
+
+
+class LogicCaptureRecipeConfig(BaseModel):
+    """Reproducible Saleae capture configuration."""
+
+    description: str | None = None
+    digital_channels: list[int] = Field(default_factory=list)
+    analog_channels: list[int] = Field(default_factory=list)
+    digital_sample_rate: int | None = Field(default=None, gt=0)
+    analog_sample_rate: int | None = Field(default=None, gt=0)
+    logic_family_volts: Literal[1.2, 1.8, 3.3] | None = 3.3
+    duration_seconds: float | None = Field(default=0.1, gt=0)
+    trigger: LogicTriggerConfig | None = None
+    uart: list[LogicUartAnalyzerConfig] = Field(default_factory=list)
+    required_metadata: list[str] = Field(default_factory=list)
+    comparison: LogicComparisonConfig | None = None
+
+    @field_validator("digital_channels", "analog_channels")
+    @classmethod
+    def unique_channels(cls, channels: list[int]) -> list[int]:
+        if any(channel < 0 for channel in channels):
+            raise ValueError("channel numbers must be non-negative")
+        if len(channels) != len(set(channels)):
+            raise ValueError("channel numbers must be unique")
+        return channels
+
+    @model_validator(mode="after")
+    def validate_capture(self) -> LogicCaptureRecipeConfig:
+        if not self.digital_channels and not self.analog_channels:
+            raise ValueError("at least one digital or analog channel is required")
+        if self.digital_channels and self.digital_sample_rate is None:
+            raise ValueError("digital_sample_rate is required for digital channels")
+        if self.analog_channels and self.analog_sample_rate is None:
+            raise ValueError("analog_sample_rate is required for analog channels")
+        if self.trigger and self.trigger.channel not in self.digital_channels:
+            raise ValueError("trigger channel must be enabled as a digital channel")
+        if self.trigger is None and self.duration_seconds is None:
+            raise ValueError("duration_seconds is required for a timed capture")
+        for uart in self.uart:
+            if uart.channel not in self.digital_channels:
+                raise ValueError(f"UART channel {uart.channel} is not enabled")
+        return self
 
 
 class LogicAnalyzerConfig(BaseModel):
@@ -59,6 +170,7 @@ class LogicAnalyzerConfig(BaseModel):
     port: int = 10430  # Logic 2 automation port (for saleae type)
     connection: str | None = None  # sigrok connection string (for sigrok type)
     channels: dict[int, LogicChannelConfig] = Field(default_factory=dict)
+    recipes: dict[str, LogicCaptureRecipeConfig] = Field(default_factory=dict)
 
 
 class InstrumentsConfig(BaseModel):
@@ -311,10 +423,7 @@ def load_config(path: str | Path | None = None) -> Config:
         FileNotFoundError: If no config file is found.
         ValueError: If the config file is invalid.
     """
-    if path is None:
-        path = find_config_file()
-    else:
-        path = Path(path)
+    path = find_config_file() if path is None else Path(path)
 
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
@@ -355,9 +464,7 @@ def find_config_file(start_dir: Path | None = None) -> Path:
     if config_path.exists():
         return config_path
 
-    raise FileNotFoundError(
-        f"No scopeloop.yaml found in {start_dir} or parent directories"
-    )
+    raise FileNotFoundError(f"No scopeloop.yaml found in {start_dir} or parent directories")
 
 
 def create_default_config(
@@ -449,8 +556,21 @@ instruments:
   #   type: saleae
   #   port: 10430
   #   channels:
-  #     0: {{signal: "SPI_CLK", label: "CLK"}}
-  #     1: {{signal: "SPI_MOSI", label: "MOSI"}}
+  #     0: {{signal: "RESETn", label: "reset", signal_type: reset,
+  #         digital: true, analog: true}}
+  #     1: {{signal: "UART_TX", label: "boot_uart", signal_type: uart}}
+  #   recipes:
+  #     boot:
+  #       digital_channels: [0, 1]
+  #       analog_channels: [0]
+  #       digital_sample_rate: 6250000
+  #       analog_sample_rate: 781250
+  #       logic_family_volts: 3.3
+  #       trigger: {{channel: 0, edge: rising, pre_trigger_seconds: 0.25,
+  #                 post_trigger_seconds: 0.75, timeout_seconds: 30}}
+  #       uart:
+  #         - {{name: boot_uart, channel: 1, baud_rate: 115200}}
+  #       required_metadata: [serial, board_revision, fixture_state]
   #
   # Sigrok-based logic analyzer (for fx2lafw, etc.):
   # logic_analyzer:

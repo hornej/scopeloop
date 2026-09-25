@@ -4,6 +4,15 @@ Hardware development automation platform for LLM coding agents.
 
 ScopeLoop enables AI coding assistants like Claude Code to autonomously develop and debug embedded firmware by providing direct access to hardware tools, build systems, and measurement instruments.
 
+## Bench workflows
+
+- [Scope ripple, noise floor and load-step evidence](docs/scope-capture.md)
+- [Saleae capture, decode and native labels](docs/logic-capture.md)
+- [ngscopeclient and PulseView exports](docs/waveform-viewers.md)
+- [Ownership, device diagnostics and runtime updates](docs/bench-operations.md)
+- [Host setup](docs/host-setup.md)
+- [Focused ScopeLoop skill](skills/scopeloop-bench/SKILL.md)
+
 ## Features
 
 - **MCP Integration**: Exposes hardware tools directly to Claude Code via Model Context Protocol
@@ -11,6 +20,7 @@ ScopeLoop enables AI coding assistants like Claude Code to autonomously develop 
 - **Serial Monitoring**: Capture and analyze serial output with timestamped logs
 - **Oscilloscope Control**: Siglent SDS1000X-E integration for waveform capture and measurement
 - **Logic Analyzer**: Saleae Logic 2 integration for digital signal analysis
+- **Offline Viewers**: Verified evidence exports to ngscopeclient CSV and native PulseView sessions
 - **Fixture Layer**: Model relays, Qwiic sensors, cameras, probes, and custom DUT actuation
 - **Safety Guardrails**: Boot loop detection, circuit breakers, and rate limiting
 - **Session Management**: Complete audit trail with artifacts and event timeline
@@ -19,7 +29,7 @@ ScopeLoop enables AI coding assistants like Claude Code to autonomously develop 
 
 ```bash
 python -m venv .venv
-.venv/bin/python -m pip install -e ".[dev,all-instruments]"
+.venv/bin/python -m pip install -e ".[dev,saleae]"
 ```
 
 ## Quick Start
@@ -144,6 +154,29 @@ wait for the status LED, capture thermal image, and verify recovery."
 
 See [docs/hardware-spec.md](docs/hardware-spec.md) for the carrier board and
 fixture expansion hardware direction.
+
+## Reproducible logic evidence
+
+Saleae captures can be driven from named recipes and saved as automatic,
+hashed evidence bundles:
+
+```bash
+scopeloop logic connect --config scopeloop.yaml
+scopeloop logic capture --recipe boot --metadata serial=unit-001 \
+  --metadata board_revision=A --output-root ./captures
+scopeloop logic compare --reference ./captures/known-good \
+  --dut ./captures/dut --align-channel 0 --edge rising
+```
+
+Recipes define channels and sidecar names, digital/analog sample rates, the
+Saleae logic-family setting, pre/post-trigger windows and timeout, UART
+decoders, required arbitrary run metadata, and optional comparison defaults.
+The original `.sal` remains untouched; the official API does not support native
+channel-label mutation, so `channel-map.json` is authoritative.
+
+See [docs/logic-capture.md](docs/logic-capture.md) for the schema, bundle
+contents, electrical interpretation, trigger semantics, API limitations, and
+known-good-versus-DUT workflow.
 
 ## Architecture
 

@@ -114,3 +114,11 @@ python3 -m venv .venv
 
 Install PicoScope 7 and Saleae Logic 2 on the host OS, then apply the Linux USB
 permissions they require. Keep the capture directory on the NVMe.
+
+## Updating an existing bench
+
+Follow [bench operations](bench-operations.md#release-and-rollback) for versioned,
+rollback-capable runtime updates. Discover the authoritative installed environment
+instead of assuming that either a checkout or a similarly named directory is live.
+Keep large Linux build/capture data on the designated NVMe volume. See
+[scope evidence](scope-capture.md) for the CLI/MCP acquisition workflow.

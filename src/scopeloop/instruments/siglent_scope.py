@@ -1,19 +1,22 @@
 """Siglent SDS1000X-E series oscilloscope driver.
 
-Uses SCPI commands over LAN (TCP/IP) via PyVISA.
+Uses bounded SCPI transactions over a raw LAN TCP socket.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import struct
-from dataclasses import dataclass
-from typing import Any
+import math
+import re
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 import numpy as np
 
 from scopeloop.instruments.base import Instrument, InstrumentError, InstrumentInfo
+from scopeloop.resources import HostLease, TaskRLock, serialized
+from scopeloop.scpi import integer, number
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +32,10 @@ class WaveformData:
     voltage_scale: float  # Volts per division
     voltage_offset: float  # Vertical offset in volts
     record_length: int  # Number of points
+
+    raw_data: bytes = field(default=b"", repr=False)
+    raw_response: bytes = field(default=b"", repr=False)
+    metadata: dict = field(default_factory=dict)
 
     @property
     def time_array(self) -> np.ndarray:
@@ -65,6 +72,7 @@ class WaveformData:
             "voltage_scale": self.voltage_scale,
             "voltage_offset": self.voltage_offset,
             "record_length": self.record_length,
+            "metadata": self.metadata,
             "vpp": self.vpp,
             "vmax": self.vmax,
             "vmin": self.vmin,
@@ -90,6 +98,7 @@ class Measurement:
             "unit": self.unit,
             "channel": self.channel,
             "timestamp": self.timestamp,
+            "freshness": "unverified instrument snapshot; use capture evidence",
         }
 
 
@@ -119,7 +128,13 @@ class SiglentSDS1000X(Instrument):
             print(f"Captured {len(waveform.samples)} samples")
     """
 
-    def __init__(self, address: str, port: int = 5025, timeout: float = 10.0):
+    def __init__(
+        self,
+        address: str,
+        port: int = 5025,
+        timeout: float = 10.0,
+        expected_serial: str | None = None,
+    ):
         """Initialize the oscilloscope driver.
 
         Args:
@@ -127,19 +142,28 @@ class SiglentSDS1000X(Instrument):
             port: SCPI port (default 5025 for raw socket).
             timeout: Command timeout in seconds.
         """
+        self.expected_serial = expected_serial
         self.address = address
         self.port = port
         self.timeout = timeout
 
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
-        self._lock = asyncio.Lock()
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be finite and positive")
+        self._lock = TaskRLock()
+        self._lease = None
+        self._armed_at = None
+        self._freshness = None
+        self.transcript = []
+        self._raw_response = b""
         self._connected = False
 
     @property
     def is_connected(self) -> bool:
         return self._connected
 
+    @serialized
     async def connect(self) -> None:
         """Connect to the oscilloscope."""
         if self._connected:
@@ -148,41 +172,43 @@ class SiglentSDS1000X(Instrument):
         logger.info(f"Connecting to Siglent scope at {self.address}:{self.port}")
 
         try:
+            addresses = await asyncio.wait_for(
+                asyncio.get_running_loop().getaddrinfo(self.address, self.port), self.timeout
+            )
+            canonical = addresses[0][4][0]
+            self._lease = HostLease(f"scope:{canonical}:{self.port}")
+            self._lease.acquire()
             self._reader, self._writer = await asyncio.wait_for(
-                asyncio.open_connection(self.address, self.port),
+                asyncio.open_connection(canonical, self.port),
                 timeout=self.timeout,
             )
             self._connected = True
 
-            # Clear any pending data
-            await self._write("*CLS")
-
             # Verify connection
             idn = await self._query("*IDN?")
+            if self.expected_serial and idn.split(",")[2].strip() != self.expected_serial:
+                raise InstrumentError("Scope serial does not match configured identity")
             logger.info(f"Connected to: {idn}")
 
-        except Exception as e:
-            self._connected = False
-            raise InstrumentError(f"Failed to connect to oscilloscope: {e}") from e
+        except BaseException:
+            await self.disconnect()
+            raise
 
+    @serialized
     async def disconnect(self) -> None:
         """Disconnect from the oscilloscope."""
-        if not self._connected:
-            return
-
-        logger.info("Disconnecting from oscilloscope")
-
         if self._writer:
             self._writer.close()
-            try:
-                await self._writer.wait_closed()
-            except Exception:
-                pass
-
         self._reader = None
         self._writer = None
         self._connected = False
+        self._armed_at = None
+        self._freshness = None
+        if self._lease:
+            self._lease.release()
+            self._lease = None
 
+    @serialized
     async def get_info(self) -> InstrumentInfo:
         """Get oscilloscope information."""
         idn = await self._query("*IDN?")
@@ -196,10 +222,21 @@ class SiglentSDS1000X(Instrument):
             address=f"{self.address}:{self.port}",
         )
 
+    @serialized
+    async def write(self, command: str) -> None:
+        """Send a raw SCPI command."""
+        await self._write(command)
+
+    @serialized
+    async def query(self, command: str) -> str:
+        """Send a raw SCPI query and return its response."""
+        return await self._query(command)
+
     # =========================================================================
     # Channel Configuration
     # =========================================================================
 
+    @serialized
     async def set_channel_scale(self, channel: str, volts_per_div: float) -> None:
         """Set the vertical scale for a channel.
 
@@ -210,12 +247,14 @@ class SiglentSDS1000X(Instrument):
         ch = self._normalize_channel(channel)
         await self._write(f"{ch}:VDIV {volts_per_div}")
 
+    @serialized
     async def get_channel_scale(self, channel: str) -> float:
         """Get the vertical scale for a channel."""
         ch = self._normalize_channel(channel)
         response = await self._query(f"{ch}:VDIV?")
-        return float(response.split()[-1])
+        return number(response, f"{ch}:VDIV")
 
+    @serialized
     async def set_channel_offset(self, channel: str, offset: float) -> None:
         """Set the vertical offset for a channel.
 
@@ -226,6 +265,7 @@ class SiglentSDS1000X(Instrument):
         ch = self._normalize_channel(channel)
         await self._write(f"{ch}:OFST {offset}")
 
+    @serialized
     async def set_channel_coupling(self, channel: str, coupling: str) -> None:
         """Set the input coupling for a channel.
 
@@ -234,8 +274,12 @@ class SiglentSDS1000X(Instrument):
             coupling: "DC", "AC", or "GND".
         """
         ch = self._normalize_channel(channel)
-        await self._write(f"{ch}:CPL {coupling.upper()}")
+        coupling = {"DC": "D1M", "AC": "A1M", "GND": "GND"}.get(coupling.upper())
+        if coupling is None:
+            raise ValueError("coupling must be DC, AC, or GND")
+        await self._write(f"{ch}:CPL {coupling}")
 
+    @serialized
     async def set_channel_enabled(self, channel: str, enabled: bool) -> None:
         """Enable or disable a channel.
 
@@ -251,6 +295,7 @@ class SiglentSDS1000X(Instrument):
     # Timebase Configuration
     # =========================================================================
 
+    @serialized
     async def set_timebase(self, seconds_per_div: float) -> None:
         """Set the horizontal timebase.
 
@@ -259,15 +304,17 @@ class SiglentSDS1000X(Instrument):
         """
         await self._write(f"TDIV {seconds_per_div}")
 
+    @serialized
     async def get_timebase(self) -> float:
         """Get the horizontal timebase in seconds per division."""
         response = await self._query("TDIV?")
-        return float(response.split()[-1])
+        return number(response, "TDIV")
 
     # =========================================================================
     # Trigger Configuration
     # =========================================================================
 
+    @serialized
     async def set_trigger_level(self, level: float, source: str = "CH1") -> None:
         """Set the trigger level.
 
@@ -278,6 +325,7 @@ class SiglentSDS1000X(Instrument):
         src = self._normalize_channel(source)
         await self._write(f"{src}:TRLV {level}")
 
+    @serialized
     async def set_trigger_mode(self, mode: str) -> None:
         """Set the trigger mode.
 
@@ -286,6 +334,7 @@ class SiglentSDS1000X(Instrument):
         """
         await self._write(f"TRMD {mode.upper()}")
 
+    @serialized
     async def force_trigger(self) -> None:
         """Force a trigger."""
         await self._write("FRTR")
@@ -294,96 +343,187 @@ class SiglentSDS1000X(Instrument):
     # Acquisition
     # =========================================================================
 
+    @serialized
     async def run(self) -> None:
         """Start acquisition."""
         await self._write("TRMD AUTO")
 
+    @serialized
     async def stop(self) -> None:
         """Stop acquisition."""
         await self._write("STOP")
 
+    @serialized
     async def single(self) -> None:
-        """Single acquisition."""
-        await self._write("TRMD SINGLE")
+        """Start a fresh single shot; this is armed, not a completed capture."""
+        await self._begin_acquisition("SINGLE")
 
+    @serialized
+    async def _begin_acquisition(self, mode: str) -> None:
+        self._freshness = None
+        await self._write("STOP")
+        self._armed_at = None
+        info = await self.get_info()
+        revision = re.search(r"(\d+)\.(\d+)\.(\d+)R(\d+)$", info.firmware_version or "")
+        if (
+            info.model in {"SDS1104X-E", "SDS1204X-E"}
+            and revision
+            and tuple(map(int, revision.groups())) >= (6, 1, 36, 6)
+        ):
+            await self._write(":ACQ:CSW")
+        # INR reads and clears the event latch. Never accept a previous bit 0.
+        await self._query("INR?")
+        self._armed_at = datetime.now(UTC).isoformat()
+        await self._write(f"TRMD {mode}")
+        actual = (await self._query("TRMD?")).split()[-1].upper()
+        if actual not in ({"AUTO"} if mode == "AUTO" else {"SINGLE", "STOP"}):
+            raise InstrumentError(f"Requested {mode}, instrument returned {actual}")
+
+    @serialized
     async def wait_for_trigger(self, timeout: float = 10.0) -> bool:
-        """Wait for trigger to occur.
+        if self._armed_at is None:
+            raise InstrumentError("No acquisition was armed by this connection")
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be finite and positive")
+        try:
+            async with asyncio.timeout(timeout):
+                while True:
+                    response = await self._query("INR?")
+                    if integer(response, "INR") & 1:
+                        self._freshness = {
+                            "armed_at": self._armed_at,
+                            "observed_at": datetime.now(UTC).isoformat(),
+                            "inr": response,
+                        }
+                        return True
+                    await asyncio.sleep(0.05)
+        except TimeoutError:
+            return False
 
-        Args:
-            timeout: Maximum time to wait.
-
-        Returns:
-            True if triggered, False if timeout.
-        """
-        start = asyncio.get_event_loop().time()
-        while asyncio.get_event_loop().time() - start < timeout:
-            status = await self._query("INR?")
-            # Bit 0 indicates trigger
-            if int(status) & 1:
-                return True
-            await asyncio.sleep(0.1)
-        return False
-
-    # =========================================================================
-    # Waveform Capture
-    # =========================================================================
-
+    @serialized
     async def capture_waveform(
         self,
         channel: str = "CH1",
         points: int | None = None,
+        *,
+        acquisition: str = "auto",
+        timeout: float = 10.0,
     ) -> WaveformData:
-        """Capture waveform data from a channel.
+        """Acquire AUTO, arm SINGLE, or finish this connection's armed shot.
 
-        Args:
-            channel: Channel to capture.
-            points: Number of points (None = all available).
-
-        Returns:
-            WaveformData object with samples and metadata.
+        The whole acquisition/readback/transfer is serialized. Failure never
+        falls back to the previous waveform. Successful captures leave STOP.
         """
         ch = self._normalize_channel(channel)
-
-        # Set up waveform transfer
-        await self._write(f"WFSU SP,1,NP,{points or 0},FP,0")
-        await self._write(f"{ch}:WF? DAT2")
-
-        # Read waveform data
-        raw_data = await self._read_binary()
-
-        # Get waveform parameters
-        vdiv = await self.get_channel_scale(channel)
-        tdiv = await self.get_timebase()
-
-        # Parse vertical parameters
-        voffset = float((await self._query(f"{ch}:OFST?")).split()[-1])
-
-        # Siglent sends 8-bit signed data, scaled by VDIV
-        # Data format: header + data + terminator
-        samples = np.frombuffer(raw_data, dtype=np.int8).astype(np.float64)
-
-        # Scale to volts: value * (vdiv / 25) - voffset
-        # The 25 is divisions of the 8-bit range per div
-        samples = samples * (vdiv / 25.0) - voffset
-
-        # Calculate sample rate from timebase
-        # 14 divisions on screen, typical memory depth
-        sample_rate = len(samples) / (14 * tdiv)
-
-        return WaveformData(
-            channel=channel,
-            samples=samples,
-            sample_rate=sample_rate,
-            time_offset=0.0,  # Would need to query TRDL
-            voltage_scale=vdiv,
-            voltage_offset=voffset,
-            record_length=len(samples),
-        )
+        if points is not None and (
+            isinstance(points, bool) or not isinstance(points, int) or points <= 0
+        ):
+            raise ValueError("points must be a positive integer")
+        if acquisition not in {"auto", "single", "armed"}:
+            raise ValueError("acquisition must be auto, single, or armed")
+        info = await self.get_info()
+        if info.model not in {"SDS1104X-E", "SDS1204X-E", "SDS1102X-E", "SDS1202X-E"}:
+            raise InstrumentError(f"Unqualified waveform model: {info.model}")
+        # Other acquisition modes can mix old sweeps or alter the sample layout.
+        acqw = await self._query("ACQW?")
+        if acqw.split()[-1].upper() != "SAMPLING":
+            raise InstrumentError("Fresh capture requires ACQW SAMPLING; configure explicitly")
+        try:
+            if acquisition != "armed":
+                await self._begin_acquisition(acquisition.upper())
+            if self._freshness is None and not await self.wait_for_trigger(timeout):
+                raise InstrumentError("No fresh acquisition before deadline; no waveform returned")
+            events = [self._freshness]
+            if acquisition == "auto":
+                self._freshness = None
+                await asyncio.sleep(0.3)
+                if not await self.wait_for_trigger(timeout):
+                    raise InstrumentError("No second fresh AUTO acquisition before deadline")
+                events.append(self._freshness)
+            await self._write("STOP")
+            freshness = {"events": events}
+            self._freshness = None
+            self._armed_at = None
+            await self._write(f"WFSU SP,1,NP,{points or 0},FP,0")
+            commands = [
+                "*IDN?",
+                "TRMD?",
+                "TDIV?",
+                "TRDL?",
+                "SARA?",
+                "WFSU?",
+                "ACQW?",
+                "BWL?",
+                "TRSE?",
+                f"{ch}:VDIV?",
+                f"{ch}:OFST?",
+                f"{ch}:ATTN?",
+                f"{ch}:CPL?",
+                f"{ch}:TRA?",
+            ]
+            setup = {command: await self._query(command) for command in commands}
+            if setup["TRMD?"].split()[-1].upper() != "STOP":
+                raise InstrumentError("Acquisition did not stop")
+            if setup[f"{ch}:TRA?"].split()[-1].upper() != "ON":
+                raise InstrumentError(f"{ch} is not enabled")
+            transfer = re.fullmatch(
+                r"(?:WFSU|WAVEFORM_SETUP)?\s*SP,(\d+),NP,(\d+),FP,(\d+)",
+                setup["WFSU?"],
+                re.IGNORECASE,
+            )
+            if not transfer or tuple(map(int, transfer.groups())) not in {
+                (1, points or 0, 0),
+                (0, points or 0, 0),
+            }:
+                raise InstrumentError(f"Unexpected transfer setup: {setup['WFSU?']}")
+            rate = number(setup["SARA?"], "SARA")
+            vdiv = number(setup[f"{ch}:VDIV?"], f"{ch}:VDIV")
+            offset = number(setup[f"{ch}:OFST?"], f"{ch}:OFST")
+            tdiv = number(setup["TDIV?"], "TDIV")
+            delay = number(setup["TRDL?"], "TRDL")
+            attenuation = number(setup[f"{ch}:ATTN?"], f"{ch}:ATTN")
+            if min(rate, vdiv, tdiv, attenuation) <= 0:
+                raise InstrumentError("Invalid acquisition metadata")
+            raw = await self._query_binary(f"{ch}:WF? DAT2")
+            if points is not None and len(raw) > points:
+                raise InstrumentError("Scope ignored requested transfer point limit")
+            codes = np.frombuffer(raw, dtype=np.int8)
+            return WaveformData(
+                channel=channel,
+                samples=codes.astype(np.float64) * (vdiv / 25) - offset,
+                sample_rate=rate,
+                time_offset=delay - 7 * tdiv,
+                voltage_scale=vdiv,
+                voltage_offset=offset,
+                record_length=len(raw),
+                raw_data=raw,
+                raw_response=self._raw_response,
+                metadata={
+                    "setup": setup,
+                    "freshness": freshness,
+                    "acquisition": acquisition,
+                    "acquired_points": len(raw) if points is None else None,
+                    "transfer_point_limit": points,
+                    "partial_transfer": None if points else False,
+                    "attenuation": attenuation,
+                    "attenuation_already_in_vdiv": True,
+                    "clipping_detected": bool(np.any((codes <= -125) | (codes >= 125))),
+                    "clipping_check": "ADC endpoint heuristic; inspect trace and probe limits",
+                    "timing_source": "SARA, TDIV, TRDL; SP=1, FP=0",
+                    "acquired_at": datetime.now(UTC).isoformat(),
+                },
+            )
+        finally:
+            self._armed_at = None
+            self._freshness = None
+            if self._connected:
+                await self._write("STOP")
 
     # =========================================================================
     # Measurements
     # =========================================================================
 
+    @serialized
     async def measure_frequency(self, channel: str) -> Measurement:
         """Measure signal frequency."""
         ch = self._normalize_channel(channel)
@@ -392,6 +532,7 @@ class SiglentSDS1000X(Instrument):
         value = self._parse_measurement(response)
         return Measurement("frequency", value, "Hz", channel)
 
+    @serialized
     async def measure_period(self, channel: str) -> Measurement:
         """Measure signal period."""
         ch = self._normalize_channel(channel)
@@ -400,6 +541,7 @@ class SiglentSDS1000X(Instrument):
         value = self._parse_measurement(response)
         return Measurement("period", value, "s", channel)
 
+    @serialized
     async def measure_amplitude(self, channel: str) -> Measurement:
         """Measure signal amplitude (Vpp)."""
         ch = self._normalize_channel(channel)
@@ -408,6 +550,7 @@ class SiglentSDS1000X(Instrument):
         value = self._parse_measurement(response)
         return Measurement("amplitude", value, "V", channel)
 
+    @serialized
     async def measure_vmax(self, channel: str) -> Measurement:
         """Measure maximum voltage."""
         ch = self._normalize_channel(channel)
@@ -416,6 +559,7 @@ class SiglentSDS1000X(Instrument):
         value = self._parse_measurement(response)
         return Measurement("vmax", value, "V", channel)
 
+    @serialized
     async def measure_vmin(self, channel: str) -> Measurement:
         """Measure minimum voltage."""
         ch = self._normalize_channel(channel)
@@ -424,6 +568,7 @@ class SiglentSDS1000X(Instrument):
         value = self._parse_measurement(response)
         return Measurement("vmin", value, "V", channel)
 
+    @serialized
     async def measure_vrms(self, channel: str) -> Measurement:
         """Measure RMS voltage."""
         ch = self._normalize_channel(channel)
@@ -432,6 +577,7 @@ class SiglentSDS1000X(Instrument):
         value = self._parse_measurement(response)
         return Measurement("vrms", value, "V", channel)
 
+    @serialized
     async def measure_rise_time(self, channel: str) -> Measurement:
         """Measure rise time (10-90%)."""
         ch = self._normalize_channel(channel)
@@ -440,6 +586,7 @@ class SiglentSDS1000X(Instrument):
         value = self._parse_measurement(response)
         return Measurement("rise_time", value, "s", channel)
 
+    @serialized
     async def measure_fall_time(self, channel: str) -> Measurement:
         """Measure fall time (90-10%)."""
         ch = self._normalize_channel(channel)
@@ -448,6 +595,7 @@ class SiglentSDS1000X(Instrument):
         value = self._parse_measurement(response)
         return Measurement("fall_time", value, "s", channel)
 
+    @serialized
     async def measure_duty_cycle(self, channel: str) -> Measurement:
         """Measure duty cycle."""
         ch = self._normalize_channel(channel)
@@ -456,6 +604,7 @@ class SiglentSDS1000X(Instrument):
         value = self._parse_measurement(response)
         return Measurement("duty_cycle", value, "%", channel)
 
+    @serialized
     async def measure(self, channel: str, measurement_type: str) -> Measurement:
         """Take a measurement of the specified type.
 
@@ -490,121 +639,107 @@ class SiglentSDS1000X(Instrument):
     # Screenshot
     # =========================================================================
 
+    @serialized
     async def screenshot(self) -> bytes:
-        """Capture a screenshot from the oscilloscope.
-
-        Returns:
-            PNG image data.
-        """
-        await self._write("SCDP")
-        data = await self._read_binary()
-        return data
-
-    # =========================================================================
-    # Internal Methods
-    # =========================================================================
+        # SDS1000X-E SCDP is a BMP stream, not a SCPI block or PNG.
+        async with asyncio.timeout(self.timeout):
+            try:
+                await self._write("SCDP")
+                header = await self._reader.readexactly(14)
+                size = int.from_bytes(header[2:6], "little")
+                if header[:2] != b"BM" or not 14 <= size <= 32_000_000:
+                    raise InstrumentError("Invalid BMP screenshot header")
+                return header + await self._reader.readexactly(size - 14)
+            except BaseException:
+                await self.disconnect()
+                raise
 
     def _normalize_channel(self, channel: str) -> str:
-        """Normalize channel name to SCPI format."""
-        ch = channel.upper()
-        if ch.startswith("CH"):
-            return f"C{ch[2:]}"
-        elif ch.startswith("C") and ch[1:].isdigit():
-            return ch
-        else:
-            return f"C{ch}"
+        ch = channel.upper().removeprefix("CH").removeprefix("C")
+        if ch not in {"1", "2", "3", "4"}:
+            raise ValueError(f"Invalid analog channel: {channel}")
+        return f"C{ch}"
 
+    @serialized
     async def _write(self, command: str) -> None:
-        """Send a command to the oscilloscope."""
         if not self._connected or not self._writer:
             raise InstrumentError("Not connected")
+        if not command.strip() or "\n" in command or "\r" in command:
+            raise ValueError("SCPI command must be one nonempty line")
+        try:
+            async with asyncio.timeout(self.timeout):
+                self._writer.write((command + "\n").encode("ascii"))
+                await self._writer.drain()
+            self.transcript.append({"utc": datetime.now(UTC).isoformat(), "command": command})
+        except BaseException:
+            await self.disconnect()
+            raise
 
-        async with self._lock:
-            self._writer.write(f"{command}\n".encode())
-            await self._writer.drain()
-            logger.debug(f"SCPI write: {command}")
-
+    @serialized
     async def _query(self, command: str) -> str:
-        """Send a query and read the response."""
-        if not self._connected or not self._reader:
-            raise InstrumentError("Not connected")
+        try:
+            async with asyncio.timeout(self.timeout):
+                await self._write(command)
+                # Permit a delayed extra LF after a binary block, never empty data.
+                for _ in range(3):
+                    response = await self._reader.readline()
+                    if not response:
+                        raise InstrumentError("EOF waiting for SCPI response")
+                    if response.strip():
+                        result = response.decode("ascii").strip()
+                        self.transcript[-1]["response"] = result
+                        return result
+                raise InstrumentError("Empty SCPI response")
+        except BaseException:
+            await self.disconnect()
+            raise
 
-        async with self._lock:
-            self._writer.write(f"{command}\n".encode())
-            await self._writer.drain()
-
-            response = await asyncio.wait_for(
-                self._reader.readline(),
-                timeout=self.timeout,
-            )
-            result = response.decode().strip()
-            logger.debug(f"SCPI query: {command} -> {result[:100]}...")
-            return result
-
-    async def _read_binary(self) -> bytes:
-        """Read binary data block."""
-        if not self._connected or not self._reader:
-            raise InstrumentError("Not connected")
-
-        async with self._lock:
-            # Read header: #NXXXXX where N is number of digits and XXXXX is byte count
-            header = await self._reader.read(2)
-            if header[0:1] != b"#":
-                raise InstrumentError(f"Invalid binary header: {header}")
-
-            num_digits = int(header[1:2])
-            size_bytes = await self._reader.read(num_digits)
-            size = int(size_bytes)
-
-            # Read data
-            data = await self._reader.readexactly(size)
-
-            # Read terminator
-            await self._reader.readline()
-
-            return data
+    @serialized
+    async def _query_binary(self, command: str) -> bytes:
+        try:
+            async with asyncio.timeout(self.timeout):
+                await self._write(command)
+                prefix = bytearray()
+                while len(prefix) < 128:
+                    byte = await self._reader.readexactly(1)
+                    prefix.extend(byte)
+                    if byte == b"#":
+                        break
+                else:
+                    raise InstrumentError("Missing bounded SCPI block header")
+                lead = bytes(prefix[:-1]).strip()
+                expected_channel = command.split(":", 1)[0].encode()
+                if lead and not re.fullmatch(
+                    expected_channel + rb":(?:WF|WAVEFORM)\s+DAT2,?", lead
+                ):
+                    raise InstrumentError(f"Unexpected waveform prefix: {lead!r}")
+                digits = await self._reader.readexactly(1)
+                if digits not in b"123456789" or len(digits) != 1:
+                    raise InstrumentError("Invalid definite block length")
+                length = await self._reader.readexactly(int(digits))
+                if not length.isdigit():
+                    raise InstrumentError("Invalid block byte count")
+                size = int(length)
+                if not 0 < size <= 32_000_000:
+                    raise InstrumentError(f"Invalid or empty waveform length: {size}")
+                payload = await self._reader.readexactly(size)
+                # Manufacturer specifies LF LF. CR LF is accepted as a transport variant.
+                trailer = await self._reader.readexactly(2)
+                if trailer not in (b"\n\n", b"\r\n"):
+                    raise InstrumentError(f"Invalid waveform trailer: {trailer!r}")
+                self._raw_response = bytes(prefix) + digits + length + payload + trailer
+                self.transcript[-1]["binary_bytes"] = size
+                return payload
+        except BaseException:
+            # Never reuse a stream whose framing is uncertain, including cancellation.
+            await self.disconnect()
+            raise
 
     def _parse_measurement(self, response: str) -> float:
-        """Parse a measurement response."""
-        # Format: "PAVA parameter,value"
-        try:
-            parts = response.split(",")
-            if len(parts) >= 2:
-                value_str = parts[1].strip()
-                # Handle special cases like "****" for invalid measurement
-                if "*" in value_str:
-                    return float("nan")
-                # Parse value with unit suffix
-                return self._parse_value_with_unit(value_str)
-            return float(response)
-        except (ValueError, IndexError) as e:
-            logger.warning(f"Could not parse measurement: {response} - {e}")
-            return float("nan")
+        value = response.split(",")[-1].strip()
+        if "*" in value:
+            raise InstrumentError(f"Measurement unavailable: {response}")
+        return number(value)
 
     def _parse_value_with_unit(self, value_str: str) -> float:
-        """Parse a value string that may have a unit suffix."""
-        import re
-
-        # Match number with optional unit
-        match = re.match(r"([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)\s*(\w*)", value_str)
-        if not match:
-            return float(value_str)
-
-        value = float(match.group(1))
-        unit = match.group(2).lower()
-
-        # Apply unit multiplier
-        multipliers = {
-            "mv": 1e-3,
-            "uv": 1e-6,
-            "nv": 1e-9,
-            "kv": 1e3,
-            "ms": 1e-3,
-            "us": 1e-6,
-            "ns": 1e-9,
-            "khz": 1e3,
-            "mhz": 1e6,
-            "ghz": 1e9,
-        }
-
-        return value * multipliers.get(unit, 1.0)
+        return number(value_str)

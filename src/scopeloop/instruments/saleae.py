@@ -7,43 +7,54 @@ Provides full-featured integration with Saleae Logic analyzers
 from __future__ import annotations
 
 import asyncio
+import importlib.metadata
+import json
 import logging
+from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
-from enum import Enum
+from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-
 from scopeloop.instruments.base import Instrument, InstrumentError, InstrumentInfo
+from scopeloop.resources import HostLease, TaskRLock, serialized
 
 logger = logging.getLogger(__name__)
 
 
 # Check if saleae automation is available
 try:
-    from saleae import automation
+    import grpc
     from saleae.automation import (
         CaptureConfiguration,
-        DeviceConfiguration,
-        DeviceType,
+        DataTableExportConfiguration,
         DigitalTriggerCaptureMode,
         DigitalTriggerType,
         GlitchFilterEntry,
         LogicDeviceConfiguration,
         Manager,
-        ManualCaptureMode,
         RadixType,
         TimedCaptureMode,
     )
+    from saleae.grpc import saleae_pb2
 
     SALEAE_AVAILABLE = True
 except ImportError:
     SALEAE_AVAILABLE = False
-    automation = None  # type: ignore
+    grpc = None  # type: ignore
+    saleae_pb2 = None  # type: ignore
 
 
-class SaleaeDeviceType(str, Enum):
+class CaptureTimeoutError(InstrumentError):
+    """Raised when a capture does not complete within its bounded wait."""
+
+
+ProgressCallback = Callable[[dict[str, Any]], None]
+
+
+class SaleaeDeviceType(StrEnum):
     """Saleae device types."""
 
     LOGIC_8 = "logic_8"
@@ -51,7 +62,7 @@ class SaleaeDeviceType(str, Enum):
     LOGIC_PRO_16 = "logic_pro_16"
 
 
-class VoltageThreshold(str, Enum):
+class VoltageThreshold(StrEnum):
     """Digital voltage thresholds for Logic Pro devices."""
 
     V_1_2 = "1.2V"
@@ -70,6 +81,11 @@ class CaptureResult:
     digital_channels: list[int]
     analog_channels: list[int]
     _capture: Any = field(repr=False)  # saleae.automation.Capture
+    state: str = "complete"
+    capture_mode: str = "timed"
+    started_at: str | None = None
+    completed_at: str | None = None
+    trigger: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -79,6 +95,11 @@ class CaptureResult:
             "sample_rate_analog": self.sample_rate_analog,
             "digital_channels": self.digital_channels,
             "analog_channels": self.analog_channels,
+            "state": self.state,
+            "capture_mode": self.capture_mode,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "trigger": self.trigger,
         }
 
 
@@ -168,10 +189,11 @@ class SaleaeLogicAnalyzer(Instrument):
         """
         if not SALEAE_AVAILABLE:
             raise InstrumentError(
-                "Saleae automation not available. "
-                "Install with: pip install logic2-automation"
+                "Saleae automation not available. Install with: pip install logic2-automation"
             )
 
+        self._lock = TaskRLock()
+        self._lease = HostLease(f"saleae:127.0.0.1:{port}")
         self.port = port
         self.device_id = device_id
         self.launch = launch
@@ -185,6 +207,51 @@ class SaleaeLogicAnalyzer(Instrument):
     def is_connected(self) -> bool:
         return self._connected
 
+    @staticmethod
+    async def _settle_worker(future: asyncio.Future) -> Any:
+        """Drain a worker even if the owning request is cancelled again."""
+        while not future.done():
+            try:
+                await asyncio.shield(future)
+            except asyncio.CancelledError:
+                continue
+        return future.result()
+
+    async def _run_rpc(
+        self,
+        operation: Callable[[], Any],
+        *,
+        cancelled_result: Callable[[Any], None] | None = None,
+    ) -> Any:
+        """Keep ownership until a blocking RPC and any orphan cleanup finish.
+
+        Cancelling an executor await does not stop its thread or the remote RPC.
+        Shield the future so a cancelled caller can still retrieve a newly created
+        manager/capture and dispose of it before another operation starts.
+        """
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(None, operation)
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            try:
+                result = await self._settle_worker(future)
+                if cancelled_result is not None:
+                    cleanup = loop.run_in_executor(None, lambda: cancelled_result(result))
+                    await self._settle_worker(cleanup)
+            except Exception as exc:
+                logger.warning("Saleae RPC/cleanup failed during cancellation: %s", exc)
+            raise
+
+    @staticmethod
+    def _dispose_started_capture(capture: Any) -> None:
+        """Stop and close only the handle created by this cancelled/failed request."""
+        try:
+            capture.stop()
+        finally:
+            capture.close()
+
+    @serialized
     async def connect(self) -> None:
         """Connect to Logic 2 application."""
         if self._connected:
@@ -192,21 +259,41 @@ class SaleaeLogicAnalyzer(Instrument):
 
         logger.info(f"Connecting to Saleae Logic 2 on port {self.port}")
 
+        self._lease.acquire()
         try:
-            # Run connection in thread pool since it's blocking
-            loop = asyncio.get_event_loop()
-
-            if self.launch:
-                self._manager = await loop.run_in_executor(None, Manager.launch)
-            else:
-                self._manager = await loop.run_in_executor(
-                    None, lambda: Manager.connect(port=self.port)
+            methods = saleae_pb2.DESCRIPTOR.services_by_name["Manager"].methods
+            options = [
+                (
+                    "grpc.service_config",
+                    json.dumps(
+                        {
+                            "methodConfig": [
+                                {
+                                    "name": [
+                                        {
+                                            "service": "saleae.automation.Manager",
+                                            "method": method.name,
+                                        }
+                                        for method in methods
+                                        if method.name != "WaitCapture"
+                                    ],
+                                    "timeout": "60s",
+                                }
+                            ]
+                        }
+                    ),
                 )
+            ]
+            factory = Manager.launch if self.launch else Manager.connect
+            self._manager = await self._run_rpc(
+                lambda: factory(
+                    port=self.port, connect_timeout_seconds=10, grpc_channel_arguments=options
+                ),
+                cancelled_result=lambda manager: manager.close(),
+            )
 
             # Get devices
-            devices = await loop.run_in_executor(
-                None, self._manager.get_devices
-            )
+            devices = await self._run_rpc(self._manager.get_devices)
 
             if not devices:
                 raise InstrumentError("No Saleae devices found")
@@ -223,19 +310,31 @@ class SaleaeLogicAnalyzer(Instrument):
                         f"Available: {[d.device_id for d in devices]}"
                     )
             else:
+                if len(devices) != 1 or devices[0].is_simulation:
+                    raise InstrumentError(
+                        "Select a stable Saleae device_id; device is ambiguous/simulated"
+                    )
                 self._device = devices[0]
 
             self._connected = True
             logger.info(
-                f"Connected to Saleae {self._device.device_type} "
-                f"(ID: {self._device.device_id})"
+                f"Connected to Saleae {self._device.device_type} (ID: {self._device.device_id})"
             )
 
-        except Exception as e:
-            self._connected = False
-            self._manager = None
-            raise InstrumentError(f"Failed to connect to Saleae: {e}")
+        except BaseException as e:
+            try:
+                if self._manager:
+                    with suppress(Exception):
+                        await self._run_rpc(self._manager.close)
+            finally:
+                self._lease.release()
+                self._connected = False
+                self._manager = None
+            if isinstance(e, asyncio.CancelledError):
+                raise
+            raise InstrumentError(f"Failed to connect to Saleae: {e}") from e
 
+    @serialized
     async def disconnect(self) -> None:
         """Disconnect from Logic 2."""
         if not self._connected:
@@ -243,17 +342,18 @@ class SaleaeLogicAnalyzer(Instrument):
 
         logger.info("Disconnecting from Saleae Logic 2")
 
-        if self._manager:
-            try:
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, self._manager.close)
-            except Exception as e:
-                logger.warning(f"Error closing manager: {e}")
+        try:
+            if self._manager:
+                await self._run_rpc(self._manager.close)
+        except Exception as e:
+            logger.warning(f"Error closing manager: {e}")
+        finally:
+            self._manager = None
+            self._device = None
+            self._connected = False
+            self._lease.release()
 
-        self._manager = None
-        self._device = None
-        self._connected = False
-
+    @serialized
     async def get_info(self) -> InstrumentInfo:
         """Get device information."""
         if not self._device:
@@ -266,9 +366,11 @@ class SaleaeLogicAnalyzer(Instrument):
             instrument_type="logic_analyzer",
             model=str(self._device.device_type),
             serial=self._device.device_id,
+            firmware_version=None,  # Device firmware is not exposed by the automation API.
             address=f"localhost:{self.port}",
         )
 
+    @serialized
     async def list_devices(self) -> list[dict[str, Any]]:
         """List connected Saleae devices.
 
@@ -278,8 +380,7 @@ class SaleaeLogicAnalyzer(Instrument):
         if not self._manager:
             raise InstrumentError("Not connected")
 
-        loop = asyncio.get_event_loop()
-        devices = await loop.run_in_executor(None, self._manager.get_devices)
+        devices = await self._run_rpc(self._manager.get_devices)
 
         return [
             {
@@ -290,6 +391,149 @@ class SaleaeLogicAnalyzer(Instrument):
             for d in devices
         ]
 
+    @serialized
+    async def get_software_info(self) -> dict[str, Any]:
+        """Return Logic 2 and automation API identity when exposed by the API."""
+        result: dict[str, Any] = {
+            "automation_package": "logic2-automation",
+            "automation_package_version": None,
+            "logic_app_version": None,
+            "logic_api_version": None,
+            "native_channel_labels_supported": False,
+        }
+        with suppress(importlib.metadata.PackageNotFoundError):
+            result["automation_package_version"] = importlib.metadata.version("logic2-automation")
+
+        if not self._manager:
+            return result
+
+        try:
+            app_info = await self._run_rpc(self._manager.get_app_info)
+        except Exception as exc:
+            result["app_info_error"] = str(exc)
+            return result
+
+        result["logic_app_version"] = self._format_version(getattr(app_info, "app_version", None))
+        result["logic_api_version"] = self._format_version(getattr(app_info, "api_version", None))
+        result["logic_app_pid"] = getattr(app_info, "app_pid", None)
+        return result
+
+    @staticmethod
+    def _format_version(version: Any) -> str | None:
+        if version is None:
+            return None
+        if all(hasattr(version, part) for part in ("major", "minor", "patch")):
+            return f"{version.major}.{version.minor}.{version.patch}"
+        value = str(version)
+        return value or None
+
+    @staticmethod
+    def _threshold_volts(voltage_threshold: VoltageThreshold) -> float:
+        return {
+            VoltageThreshold.V_1_2: 1.2,
+            VoltageThreshold.V_1_8: 1.8,
+            VoltageThreshold.V_3_3: 3.3,
+        }[voltage_threshold]
+
+    @staticmethod
+    def _validate_capture_request(
+        digital_channels: list[int],
+        analog_channels: list[int],
+        sample_rate_digital: int | None,
+        sample_rate_analog: int | None,
+        trigger_channel: int | None = None,
+    ) -> None:
+        if not digital_channels and not analog_channels:
+            raise InstrumentError("At least one digital or analog channel is required")
+        for name, channels in (
+            ("digital", digital_channels),
+            ("analog", analog_channels),
+        ):
+            if len(channels) != len(set(channels)) or any(ch < 0 for ch in channels):
+                raise InstrumentError(f"{name} channels must be unique and non-negative")
+        if digital_channels and (sample_rate_digital is None or sample_rate_digital <= 0):
+            raise InstrumentError("A positive digital sample rate is required")
+        if analog_channels and (sample_rate_analog is None or sample_rate_analog <= 0):
+            raise InstrumentError("A positive analog sample rate is required")
+        if trigger_channel is not None and trigger_channel not in digital_channels:
+            raise InstrumentError("Trigger channel must be enabled as a digital channel")
+
+    @staticmethod
+    def _emit_progress(
+        callback: ProgressCallback | None,
+        state: str,
+        **details: Any,
+    ) -> None:
+        if callback:
+            callback(
+                {
+                    "state": state,
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    **details,
+                }
+            )
+
+    async def _wait_for_capture(
+        self,
+        capture: Any,
+        timeout_seconds: float | None,
+        progress_callback: ProgressCallback | None,
+        waiting_state: str,
+    ) -> None:
+        """Wait with progress and a real gRPC deadline when the official API allows it."""
+        loop = asyncio.get_running_loop()
+
+        def do_wait() -> None:
+            if timeout_seconds is None:
+                capture.wait()
+                return
+
+            manager = getattr(capture, "manager", None)
+            capture_id = getattr(capture, "capture_id", None)
+            stub = getattr(manager, "stub", None)
+            if saleae_pb2 is None or grpc is None or stub is None or capture_id is None:
+                raise InstrumentError(
+                    "This logic2-automation build cannot provide a bounded capture wait"
+                )
+
+            request = saleae_pb2.WaitCaptureRequest(capture_id=capture_id)
+            try:
+                stub.WaitCapture(request, timeout=timeout_seconds)
+            except grpc.RpcError as exc:
+                if exc.code() != grpc.StatusCode.DEADLINE_EXCEEDED:
+                    raise
+                try:
+                    capture.stop()
+                except Exception as stop_exc:
+                    logger.warning("Could not stop timed-out Saleae capture: %s", stop_exc)
+                raise CaptureTimeoutError(
+                    f"Capture timed out after {timeout_seconds:.3f} seconds"
+                ) from exc
+
+        wait_future = loop.run_in_executor(None, do_wait)
+        started = loop.time()
+        try:
+            while not wait_future.done():
+                elapsed = loop.time() - started
+                self._emit_progress(
+                    progress_callback,
+                    waiting_state,
+                    elapsed_seconds=round(elapsed, 3),
+                    timeout_seconds=timeout_seconds,
+                )
+                await asyncio.wait({wait_future}, timeout=1.0)
+            await asyncio.shield(wait_future)
+        except BaseException:
+            # A failed progress callback also leaves the blocking wait running.
+            # Retain ownership through stop and worker settlement on every exit,
+            # so the worker cannot later affect a new client's capture.
+            with suppress(Exception):
+                await self._settle_worker(loop.run_in_executor(None, capture.stop))
+            with suppress(Exception):
+                await self._settle_worker(wait_future)
+            raise
+
+    @serialized
     async def capture(
         self,
         duration: float,
@@ -299,6 +543,8 @@ class SaleaeLogicAnalyzer(Instrument):
         sample_rate_analog: int | None = None,
         voltage_threshold: VoltageThreshold = VoltageThreshold.V_3_3,
         glitch_filter_ns: int | None = None,
+        wait_timeout_seconds: float | None = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> CaptureResult:
         """Start a timed capture.
 
@@ -317,8 +563,15 @@ class SaleaeLogicAnalyzer(Instrument):
         if not self._connected or not self._manager:
             raise InstrumentError("Not connected")
 
-        loop = asyncio.get_event_loop()
-
+        analog_channels = analog_channels or []
+        if analog_channels and sample_rate_analog is None:
+            sample_rate_analog = sample_rate_digital // 10
+        self._validate_capture_request(
+            digital_channels,
+            analog_channels,
+            sample_rate_digital,
+            sample_rate_analog,
+        )
         # Build device configuration
         glitch_filters = None
         if glitch_filter_ns:
@@ -330,21 +583,18 @@ class SaleaeLogicAnalyzer(Instrument):
                 for ch in digital_channels
             ]
 
-        # Map voltage threshold
-        threshold_map = {
-            VoltageThreshold.V_1_2: 1.2,
-            VoltageThreshold.V_1_8: 1.8,
-            VoltageThreshold.V_3_3: 3.3,
+        device_args: dict[str, Any] = {
+            "enabled_digital_channels": digital_channels,
+            "digital_sample_rate": sample_rate_digital if digital_channels else None,
+            "digital_threshold_volts": (
+                self._threshold_volts(voltage_threshold) if digital_channels else None
+            ),
+            "enabled_analog_channels": analog_channels,
+            "analog_sample_rate": sample_rate_analog if analog_channels else None,
+            "glitch_filters": glitch_filters or [],
         }
-        threshold_volts = threshold_map.get(voltage_threshold, 3.3)
-
         device_config = LogicDeviceConfiguration(
-            enabled_digital_channels=digital_channels,
-            digital_sample_rate=sample_rate_digital,
-            digital_threshold_volts=threshold_volts,
-            enabled_analog_channels=analog_channels or [],
-            analog_sample_rate=sample_rate_analog or sample_rate_digital // 10,
-            glitch_filters=glitch_filters or [],
+            **device_args,
         )
 
         capture_config = CaptureConfiguration(
@@ -353,7 +603,7 @@ class SaleaeLogicAnalyzer(Instrument):
 
         logger.info(
             f"Starting capture: {duration}s, channels {digital_channels}, "
-            f"sample rate {sample_rate_digital/1e6:.1f} MHz"
+            f"sample rate {sample_rate_digital / 1e6:.1f} MHz"
         )
 
         # Start capture (blocking)
@@ -364,29 +614,63 @@ class SaleaeLogicAnalyzer(Instrument):
                 capture_configuration=capture_config,
             )
 
-        capture = await loop.run_in_executor(None, do_capture)
+        started_at = datetime.now(UTC).isoformat()
+        self._emit_progress(progress_callback, "starting", capture_mode="timed")
+        try:
+            capture = await self._run_rpc(
+                do_capture, cancelled_result=self._dispose_started_capture
+            )
+        except Exception as exc:
+            raise InstrumentError(
+                "Logic 2 rejected the channel/sample-rate configuration: "
+                f"digital={digital_channels}@{sample_rate_digital}, "
+                f"analog={analog_channels}@{sample_rate_analog}: {exc}"
+            ) from exc
 
-        # Wait for capture to complete
-        await loop.run_in_executor(None, capture.wait)
-
+        try:
+            self._emit_progress(progress_callback, "capturing", duration_seconds=duration)
+            await self._wait_for_capture(
+                capture,
+                wait_timeout_seconds or duration + 10.0,
+                progress_callback,
+                "capturing",
+            )
+            completed_at = datetime.now(UTC).isoformat()
+            self._emit_progress(progress_callback, "complete")
+        except BaseException:
+            with suppress(Exception):
+                await self._run_rpc(lambda: self._dispose_started_capture(capture))
+            raise
         return CaptureResult(
             capture_id=str(id(capture)),
             duration=duration,
             sample_rate_digital=sample_rate_digital,
             sample_rate_analog=sample_rate_analog,
             digital_channels=digital_channels,
-            analog_channels=analog_channels or [],
+            analog_channels=analog_channels,
             _capture=capture,
+            state="complete",
+            capture_mode="timed",
+            started_at=started_at,
+            completed_at=completed_at,
         )
 
+    @serialized
     async def capture_with_trigger(
         self,
         digital_channels: list[int],
         trigger_channel: int,
         trigger_edge: str = "rising",
         sample_rate: int = 10_000_000,
+        analog_channels: list[int] | None = None,
+        sample_rate_analog: int | None = None,
+        voltage_threshold: VoltageThreshold = VoltageThreshold.V_3_3,
         pre_trigger_samples: int | None = None,
-        max_duration: float = 10.0,
+        pre_trigger_seconds: float | None = None,
+        post_trigger_seconds: float = 1.0,
+        trigger_timeout_seconds: float = 30.0,
+        progress_callback: ProgressCallback | None = None,
+        max_duration: float | None = None,
     ) -> CaptureResult:
         """Start a triggered capture.
 
@@ -396,7 +680,8 @@ class SaleaeLogicAnalyzer(Instrument):
             trigger_edge: "rising" or "falling".
             sample_rate: Digital sample rate in Hz.
             pre_trigger_samples: Samples to capture before trigger.
-            max_duration: Maximum capture duration.
+            post_trigger_seconds: Data to retain after the trigger.
+            trigger_timeout_seconds: Maximum time to wait for a trigger.
 
         Returns:
             CaptureResult with capture handle.
@@ -404,7 +689,24 @@ class SaleaeLogicAnalyzer(Instrument):
         if not self._connected or not self._manager:
             raise InstrumentError("Not connected")
 
-        loop = asyncio.get_event_loop()
+        analog_channels = analog_channels or []
+        if max_duration is not None:
+            post_trigger_seconds = max_duration
+        if pre_trigger_seconds is None:
+            pre_trigger_seconds = (pre_trigger_samples or 0) / sample_rate
+        if pre_trigger_seconds < 0 or post_trigger_seconds <= 0:
+            raise InstrumentError("Pre-trigger must be non-negative and post-trigger positive")
+        if trigger_timeout_seconds <= 0:
+            raise InstrumentError("Trigger timeout must be positive")
+        self._validate_capture_request(
+            digital_channels,
+            analog_channels,
+            sample_rate,
+            sample_rate_analog,
+            trigger_channel,
+        )
+        if trigger_edge.lower() not in {"rising", "falling"}:
+            raise InstrumentError("Trigger edge must be 'rising' or 'falling'")
 
         # Map trigger edge
         trigger_type = (
@@ -416,7 +718,9 @@ class SaleaeLogicAnalyzer(Instrument):
         device_config = LogicDeviceConfiguration(
             enabled_digital_channels=digital_channels,
             digital_sample_rate=sample_rate,
-            digital_threshold_volts=3.3,
+            digital_threshold_volts=self._threshold_volts(voltage_threshold),
+            enabled_analog_channels=analog_channels,
+            analog_sample_rate=sample_rate_analog if analog_channels else None,
         )
 
         capture_config = CaptureConfiguration(
@@ -425,13 +729,13 @@ class SaleaeLogicAnalyzer(Instrument):
                 trigger_type=trigger_type,
                 min_pulse_width_seconds=None,
                 max_pulse_width_seconds=None,
-                after_trigger_seconds=max_duration,
+                after_trigger_seconds=post_trigger_seconds,
+                trim_data_seconds=pre_trigger_seconds + post_trigger_seconds,
             )
         )
 
         logger.info(
-            f"Starting triggered capture on channel {trigger_channel} "
-            f"({trigger_edge} edge)"
+            f"Starting triggered capture on channel {trigger_channel} ({trigger_edge} edge)"
         )
 
         def do_capture() -> Any:
@@ -441,24 +745,70 @@ class SaleaeLogicAnalyzer(Instrument):
                 capture_configuration=capture_config,
             )
 
-        capture = await loop.run_in_executor(None, do_capture)
-        await loop.run_in_executor(None, capture.wait)
+        started_at = datetime.now(UTC).isoformat()
+        try:
+            capture = await self._run_rpc(
+                do_capture, cancelled_result=self._dispose_started_capture
+            )
+        except Exception as exc:
+            raise InstrumentError(
+                "Logic 2 rejected the triggered channel/sample-rate configuration: "
+                f"digital={digital_channels}@{sample_rate}, "
+                f"analog={analog_channels}@{sample_rate_analog}: {exc}"
+            ) from exc
 
+        try:
+            self._emit_progress(
+                progress_callback,
+                "armed",
+                trigger_channel=trigger_channel,
+                trigger_edge=trigger_edge.lower(),
+                pre_trigger_seconds=pre_trigger_seconds,
+                post_trigger_seconds=post_trigger_seconds,
+                timeout_seconds=trigger_timeout_seconds,
+            )
+            await self._wait_for_capture(
+                capture,
+                trigger_timeout_seconds + post_trigger_seconds,
+                progress_callback,
+                "waiting_for_trigger",
+            )
+            completed_at = datetime.now(UTC).isoformat()
+            self._emit_progress(progress_callback, "complete")
+        except BaseException as exc:
+            with suppress(Exception):
+                await self._run_rpc(lambda: self._dispose_started_capture(capture))
+            if isinstance(exc, CaptureTimeoutError):
+                self._emit_progress(progress_callback, "trigger_timeout")
+            raise
         return CaptureResult(
             capture_id=str(id(capture)),
-            duration=max_duration,
+            duration=pre_trigger_seconds + post_trigger_seconds,
             sample_rate_digital=sample_rate,
-            sample_rate_analog=None,
+            sample_rate_analog=sample_rate_analog,
             digital_channels=digital_channels,
-            analog_channels=[],
+            analog_channels=analog_channels,
             _capture=capture,
+            state="complete",
+            capture_mode="digital_trigger",
+            started_at=started_at,
+            completed_at=completed_at,
+            trigger={
+                "channel": trigger_channel,
+                "edge": trigger_edge.lower(),
+                "pre_trigger_seconds": pre_trigger_seconds,
+                "post_trigger_seconds": post_trigger_seconds,
+                "timeout_seconds": trigger_timeout_seconds,
+            },
         )
 
+    @serialized
     async def add_analyzer(
         self,
         capture: CaptureResult,
         analyzer_type: str,
         settings: dict[str, Any],
+        label: str | None = None,
     ) -> AnalyzerResult:
         """Add a protocol analyzer to a capture.
 
@@ -478,18 +828,16 @@ class SaleaeLogicAnalyzer(Instrument):
         if not self._connected:
             raise InstrumentError("Not connected")
 
-        loop = asyncio.get_event_loop()
-
         logger.info(f"Adding {analyzer_type} analyzer")
 
         def do_add_analyzer() -> Any:
             return capture._capture.add_analyzer(
                 analyzer_type,
-                label=f"{analyzer_type}_analyzer",
+                label=label or f"{analyzer_type}_analyzer",
                 settings=settings,
             )
 
-        analyzer = await loop.run_in_executor(None, do_add_analyzer)
+        analyzer = await self._run_rpc(do_add_analyzer)
 
         return AnalyzerResult(
             analyzer_id=str(id(analyzer)),
@@ -498,6 +846,7 @@ class SaleaeLogicAnalyzer(Instrument):
             _analyzer=analyzer,
         )
 
+    @serialized
     async def export_analyzer_csv(
         self,
         capture: CaptureResult,
@@ -516,8 +865,6 @@ class SaleaeLogicAnalyzer(Instrument):
         if not self._connected:
             raise InstrumentError("Not connected")
 
-        loop = asyncio.get_event_loop()
-
         radix_map = {
             "hexadecimal": RadixType.HEXADECIMAL,
             "decimal": RadixType.DECIMAL,
@@ -529,43 +876,59 @@ class SaleaeLogicAnalyzer(Instrument):
         def do_export() -> None:
             capture._capture.export_data_table(
                 filepath=str(output_path),
-                analyzers=[analyzer._analyzer],
-                radix=radix_type,
+                analyzers=[
+                    DataTableExportConfiguration(
+                        analyzer=analyzer._analyzer,
+                        radix=radix_type,
+                    )
+                ],
             )
 
-        await loop.run_in_executor(None, do_export)
+        await self._run_rpc(do_export)
         logger.info(f"Exported analyzer data to {output_path}")
 
+    @serialized
     async def export_raw_csv(
         self,
         capture: CaptureResult,
-        output_path: Path,
+        output_dir: Path,
         digital_channels: list[int] | None = None,
         analog_channels: list[int] | None = None,
-    ) -> None:
+    ) -> list[Path]:
         """Export raw capture data to CSV.
 
         Args:
             capture: Capture to export.
-            output_path: Path for CSV file.
+            output_dir: Existing or new directory for Logic's analog.csv/digital.csv.
             digital_channels: Channels to export (None = all).
             analog_channels: Analog channels to export (None = all).
         """
         if not self._connected:
             raise InstrumentError("Not connected")
 
-        loop = asyncio.get_event_loop()
+        output_dir.mkdir(parents=True, exist_ok=True)
 
         def do_export() -> None:
             capture._capture.export_raw_data_csv(
-                filepath=str(output_path),
-                digital_channels=digital_channels or capture.digital_channels,
-                analog_channels=analog_channels or capture.analog_channels,
+                directory=str(output_dir.resolve()),
+                digital_channels=(
+                    digital_channels if digital_channels is not None else capture.digital_channels
+                ),
+                analog_channels=(
+                    analog_channels if analog_channels is not None else capture.analog_channels
+                ),
             )
 
-        await loop.run_in_executor(None, do_export)
-        logger.info(f"Exported raw data to {output_path}")
+        await self._run_rpc(do_export)
+        paths = [
+            path
+            for path in (output_dir / "digital.csv", output_dir / "analog.csv")
+            if path.exists()
+        ]
+        logger.info("Exported raw data to %s", output_dir)
+        return paths
 
+    @serialized
     async def save_capture(self, capture: CaptureResult, output_path: Path) -> None:
         """Save capture to a .sal file.
 
@@ -576,14 +939,20 @@ class SaleaeLogicAnalyzer(Instrument):
         if not self._connected:
             raise InstrumentError("Not connected")
 
-        loop = asyncio.get_event_loop()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
 
         def do_save() -> None:
             capture._capture.save_capture(filepath=str(output_path))
 
-        await loop.run_in_executor(None, do_save)
+        await self._run_rpc(do_save)
         logger.info(f"Saved capture to {output_path}")
 
+    @serialized
+    async def close_capture(self, capture: CaptureResult) -> None:
+        """Close a Logic capture tab and release its memory."""
+        await self._run_rpc(capture._capture.close)
+
+    @serialized
     async def load_capture(self, capture_path: Path) -> CaptureResult:
         """Load a previously saved capture.
 
@@ -596,12 +965,10 @@ class SaleaeLogicAnalyzer(Instrument):
         if not self._connected or not self._manager:
             raise InstrumentError("Not connected")
 
-        loop = asyncio.get_event_loop()
-
         def do_load() -> Any:
             return self._manager.load_capture(str(capture_path))  # type: ignore
 
-        capture = await loop.run_in_executor(None, do_load)
+        capture = await self._run_rpc(do_load, cancelled_result=lambda capture: capture.close())
 
         return CaptureResult(
             capture_id=str(id(capture)),
@@ -613,6 +980,7 @@ class SaleaeLogicAnalyzer(Instrument):
             _capture=capture,
         )
 
+    @serialized
     async def get_analyzer_data(
         self,
         capture: CaptureResult,
@@ -632,9 +1000,7 @@ class SaleaeLogicAnalyzer(Instrument):
         import csv
         import tempfile
 
-        with tempfile.NamedTemporaryFile(
-            suffix=".csv", delete=False, mode="w"
-        ) as f:
+        with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w") as f:
             temp_path = Path(f.name)
 
         try:
@@ -686,9 +1052,19 @@ def spi_analyzer_settings(
     settings: dict[str, Any] = {
         "Clock": clk,
         "Bits per Transfer": str(bits_per_transfer),
-        "Significant Bit": "Most Significant Bit First" if msb_first else "Least Significant Bit First",
-        "Clock State": "Clock is Low when inactive (CPOL = 0)" if clock_polarity == 0 else "Clock is High when inactive (CPOL = 1)",
-        "Clock Phase": "Data is Valid on Clock Leading Edge (CPHA = 0)" if clock_phase == 0 else "Data is Valid on Clock Trailing Edge (CPHA = 1)",
+        "Significant Bit": (
+            "Most Significant Bit First" if msb_first else "Least Significant Bit First"
+        ),
+        "Clock State": (
+            "Clock is Low when inactive (CPOL = 0)"
+            if clock_polarity == 0
+            else "Clock is High when inactive (CPOL = 1)"
+        ),
+        "Clock Phase": (
+            "Data is Valid on Clock Leading Edge (CPHA = 0)"
+            if clock_phase == 0
+            else "Data is Valid on Clock Trailing Edge (CPHA = 1)"
+        ),
     }
 
     if mosi is not None:
@@ -723,6 +1099,7 @@ def uart_analyzer_settings(
     bits_per_frame: int = 8,
     stop_bits: float = 1.0,
     parity: str = "None",
+    msb_first: bool = False,
     inverted: bool = False,
 ) -> dict[str, Any]:
     """Generate UART/Async Serial analyzer settings.
@@ -733,16 +1110,38 @@ def uart_analyzer_settings(
         bits_per_frame: Data bits (5-9).
         stop_bits: Stop bits (1, 1.5, or 2).
         parity: "None", "Even", or "Odd".
+        msb_first: True when the most significant bit is sent first.
         inverted: True for inverted signal.
 
     Returns:
         Settings dict for add_analyzer().
     """
+    bits_value = (
+        "8 Bits per Transfer (Standard)"
+        if bits_per_frame == 8
+        else f"{bits_per_frame} Bits per Transfer"
+    )
+    stop_value = {
+        1.0: "1 Stop Bit (Standard)",
+        1.5: "1.5 Stop Bits",
+        2.0: "2 Stop Bits",
+    }[stop_bits]
+    parity_value = {
+        "None": "No Parity Bit (Standard)",
+        "Even": "Even Parity Bit",
+        "Odd": "Odd Parity Bit",
+    }[parity]
     return {
         "Input Channel": rx,
         "Bit Rate (Bits/s)": baud_rate,
-        "Bits per Frame": str(bits_per_frame),
-        "Stop Bits": f"{stop_bits} Stop Bit" + ("s" if stop_bits > 1 else ""),
-        "Parity Bit": f"{parity} Parity",
-        "Signal inversion": "Inverted" if inverted else "Non Inverted",
+        "Bits per Frame": bits_value,
+        "Stop Bits": stop_value,
+        "Parity Bit": parity_value,
+        "Significant Bit": (
+            "Most Significant Bit Sent First"
+            if msb_first
+            else "Least Significant Bit Sent First (Standard)"
+        ),
+        "Signal inversion": "Inverted" if inverted else "Non Inverted (Standard)",
+        "Mode": "Normal",
     }
