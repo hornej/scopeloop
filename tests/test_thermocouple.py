@@ -321,3 +321,41 @@ def test_circuitpython_transport_requires_dtr_for_telemetry(monkeypatch, tmp_pat
         assert connection.read(time.monotonic() + 0.2) == sample
         assert connection.serial.rts is False
     assert connection.serial.closed
+
+
+def test_request_resynchronizes_console_and_ignores_uncorrelated_parser_error():
+    from types import SimpleNamespace
+
+    connection = ThermocoupleConnection("unused", "test-device", "unused")
+    connection.event = lambda *args: None
+
+    def write(data):
+        assert data.startswith(b"\n") and data.endswith(b"\n")
+        request = json.loads(data.strip())
+        malformed = {"kind": "thermocouple", "ok": False, "error": "syntax error in JSON"}
+        reply = {
+            "kind": "thermocouple",
+            "protocol": "scopeloop-max31856-v1",
+            "device": "test-device",
+            "boot": "boot-a",
+            "ok": True,
+            "id": request["id"],
+        }
+        connection.pending = (json.dumps(malformed) + "\n" + json.dumps(reply) + "\n").encode()
+        return len(data)
+
+    connection.serial = SimpleNamespace(write=write)
+    assert connection.request("status")["ok"]
+
+
+def test_correlated_reply_with_wrong_identity_is_still_rejected():
+    import time
+
+    connection = ThermocoupleConnection("unused", "test-device", "unused")
+    connection.event = lambda *args: None
+    connection.pending = (
+        b'{"kind":"thermocouple","ok":true,"id":"x","device":"wrong",'
+        b'"protocol":"scopeloop-max31856-v1"}\n'
+    )
+    with pytest.raises(ValueError, match="identity"):
+        connection.read(time.monotonic() + 0.1)

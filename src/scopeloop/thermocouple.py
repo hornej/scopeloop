@@ -125,6 +125,16 @@ class ThermocoupleConnection:
                 if not isinstance(row, dict):
                     raise ValueError("Expected JSON object")
                 self.event("rx", {"monotonic": time.monotonic(), "record": row})
+                if (
+                    row.get("kind") == "thermocouple"
+                    and row.get("ok") is False
+                    and "device" not in row
+                    and "id" not in row
+                ):
+                    # A truncated prior console command may emit an uncorrelated
+                    # parser error. Preserve it, but never accept it as telemetry
+                    # or as an acknowledgement of this client's request.
+                    return {"kind": "console_error", "unidentified_record": row}
                 if row.get("kind") in ("identity", "temperature", "thermocouple"):
                     if row.get("device") != self.device or row.get("protocol") != PROTOCOL:
                         raise ValueError("Unexpected logger identity/protocol")
@@ -142,7 +152,10 @@ class ThermocoupleConnection:
     def request(self, action, **kwargs):
         request_id = uuid.uuid4().hex
         request = {"thermocouple": action, "id": request_id, **kwargs}
-        encoded = (json.dumps(request, allow_nan=False) + "\n").encode()
+        # Discard an interrupted client's partial line before our framed request.
+        encoded = (
+            "\n" + json.dumps(request, allow_nan=False, separators=(",", ":")) + "\n"
+        ).encode()
         self.event("tx", request)
         if self.serial.write(encoded) != len(encoded):
             raise OSError("Incomplete command write")

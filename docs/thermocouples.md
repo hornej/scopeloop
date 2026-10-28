@@ -52,6 +52,10 @@ Diagnostics send an in-band JSON status request. There is no Ctrl-C/REPL probing
 and no automatic reboot. Old logger firmware supports passive capture but lacks
 the new diagnostic/recovery commands.
 
+Requests begin with a newline to discard a previous client's interrupted command.
+Uncorrelated console-parser errors are retained in raw/timeline evidence; they
+cannot satisfy a command acknowledgement or a temperature-validity check.
+
 Bundles contain original serial bytes, ScopeLoop timeline events and an artifact
 hash manifest compatible with validate_bundle. Failed operations retain their
 evidence and are marked failed. Host UTC describes receipt; sample uptime_s
