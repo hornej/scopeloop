@@ -37,8 +37,9 @@ fault, sequence and fresh-conversion checks before any load resumes.
 Use the same canonical port path and shared SCOPELOOP_LOCK_DIR as other clients.
 Every connection holds a HostLease, plus serial exclusivity where supported,
 through the complete operation. A second process fails without preempting it.
-The CLI opens with RTS/DTR deasserted; device-specific side effects of opening
-the port still need checking.
+The CLI asserts DTR to establish the CircuitPython CDC console connection and
+leaves RTS deasserted. Only use this with the intended dedicated logger:
+device-specific side effects of opening other serial hardware still need checking.
 
 ~~~sh
 scopeloop thermocouple capture "$PORT" "$DEVICE_ID" evidence/capture-01 85 --seconds 10

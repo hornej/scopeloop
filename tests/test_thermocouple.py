@@ -283,3 +283,41 @@ def test_cleanup_closes_serial_and_releases_lease_even_when_event_write_fails(tm
     with pytest.raises(OSError, match="disk full"):
         connection.__exit__(None, None, None)
     assert actions == ["serial", "events", "lease"]
+
+
+def test_circuitpython_transport_requires_dtr_for_telemetry(monkeypatch, tmp_path):
+    import time
+
+    from scopeloop import thermocouple
+
+    _, engine = fixture()
+    sample = engine.sample()
+
+    class Cdc:
+        def __init__(self, **kwargs):
+            self.dtr = False
+            self.rts = True
+            self.remaining = json.dumps(sample).encode() + b"\n"
+            self.closed = False
+
+        def open(self):
+            pass
+
+        def reset_input_buffer(self):
+            pass
+
+        def read(self, count):
+            if not self.dtr:
+                return b""
+            data, self.remaining = self.remaining[:count], self.remaining[count:]
+            return data
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setenv("SCOPELOOP_LOCK_DIR", str(tmp_path / "locks"))
+    monkeypatch.setattr(thermocouple.serial, "Serial", Cdc)
+    with ThermocoupleConnection("test-cdc", "test-device", tmp_path / "capture") as connection:
+        assert connection.read(time.monotonic() + 0.2) == sample
+        assert connection.serial.rts is False
+    assert connection.serial.closed

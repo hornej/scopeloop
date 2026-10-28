@@ -95,7 +95,8 @@ class ThermocoupleConnection:
             self.raw = (self.output / "serial.bin").open("xb")
             self.events = (self.output / "timeline.jsonl").open("x", encoding="utf-8")
             self.serial = serial.Serial(port=None, baudrate=115200, timeout=0.1)
-            self.serial.dtr = False
+            # CircuitPython CDC gates console connection/output on host DTR.
+            self.serial.dtr = True
             self.serial.rts = False
             if os.name != "nt":
                 self.serial.exclusive = True
