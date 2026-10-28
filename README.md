@@ -10,6 +10,7 @@ ScopeLoop enables AI coding assistants like Claude Code to autonomously develop 
 - [Saleae capture, decode and native labels](docs/logic-capture.md)
 - [ngscopeclient and PulseView exports](docs/waveform-viewers.md)
 - [Ownership, device diagnostics and runtime updates](docs/bench-operations.md)
+- [Thermocouple capture, diagnostics and explicit recovery](docs/thermocouples.md)
 - [Host setup](docs/host-setup.md)
 - [Focused ScopeLoop skill](skills/scopeloop-bench/SKILL.md)
 

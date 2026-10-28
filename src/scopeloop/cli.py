@@ -27,6 +27,7 @@ from scopeloop.logic import LogicCaptureService, parse_metadata
 from scopeloop.safety import GuardrailType, SafetyConfig, SafetyGuardrails
 from scopeloop.scope import ScopeConfigError, create_scope_from_config, parse_si_value
 from scopeloop.session import SessionManager
+from scopeloop.thermocouple import app as thermocouple_app
 
 app = typer.Typer(
     name="scopeloop",
@@ -35,6 +36,7 @@ app = typer.Typer(
 )
 
 console = Console()
+app.add_typer(thermocouple_app, name="thermocouple")
 
 
 def version_callback(value: bool) -> None:
