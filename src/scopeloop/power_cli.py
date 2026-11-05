@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import sys
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
@@ -22,10 +23,16 @@ class OutputState(StrEnum):
     off = "off"
 
 
+async def _confirm_master(message: str) -> bool:
+    if not sys.stdin.isatty():
+        raise ValueError("Master approval requires an operator terminal or an MCP approval form")
+    return typer.confirm(message, default=False)
+
+
 def _run(config: Path | None, name: str, **args) -> None:
     try:
         service = PowerSupplyService(load_config(config).instruments.power_supply)
-        result = asyncio.run(service.command(name, args, "cli"))
+        result = asyncio.run(service.command(name, args, "cli", approve_master=_confirm_master))
     except (OSError, ValueError, InstrumentError, ResourceError) as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(1) from exc
@@ -57,5 +64,21 @@ def configure(
 
 @app.command()
 def output(channel: int, state: OutputState, config: ConfigPath = None):
-    """Select or deselect one output. The operator controls the master switch."""
+    """Select or deselect one output without switching the master."""
     _run(config, "output", channel=channel, enabled=state == OutputState.on)
+
+
+@app.command("master-plan")
+def master_plan(
+    state: OutputState,
+    channel: Annotated[list[int] | None, typer.Option("--channel")] = None,
+    config: ConfigPath = None,
+):
+    """Preview the master change for operator approval. Repeat --channel for each rail."""
+    _run(config, "master_plan", enabled=state == OutputState.on, channels=channel or [])
+
+
+@app.command("master-apply")
+def master_apply(confirmation: str, config: ConfigPath = None):
+    """Apply a reviewed master plan once, using its explicit confirmation phrase."""
+    _run(config, "master_apply", confirmation=confirmation)

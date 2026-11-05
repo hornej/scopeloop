@@ -22,7 +22,9 @@ deployment switch. Staging and offline tests can proceed independently.
   Distinguish absent device, enumeration failure and application unresponsiveness.
 - For the HMP4040, read `docs/power-supply.md`. Start with identity and a DC
   snapshot. Setpoints and channel selection require authorization for the
-  specific DUT and channel. Keep the master under front-panel control.
+  specific DUT and channel. The master defaults to the front panel. In projects
+  that opt in, use the master preview and operator-confirmed apply workflow.
+  Show the exact affected rails and setpoints. A preview token alone is not approval.
 - For MAX31856 thermocouple capture or fault recovery, read docs/thermocouples.md.
   Preserve fault evidence, stop the DUT load on invalid data, and require an
   explicit idle acknowledgement before reinitializing. Recovery never re-arms a DUT.

@@ -3,7 +3,9 @@
 import asyncio
 import json
 import sys
+import time
 from contextlib import suppress
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,6 +22,7 @@ class Replay:
         self.selected = 3
         self.setpoints = {ch: (float(ch), 0.25) for ch in range(1, 5)}
         self.outputs = dict.fromkeys(range(1, 5), False)
+        self.master = True
         self.commands = []
         self.override = {}
         self.connections = 0
@@ -57,13 +60,17 @@ class Replay:
             self.setpoints[ch] = tuple(map(float, command.split()[1].split(",")))
         elif command.startswith("OUTP:SEL "):
             self.outputs[ch] = command.endswith(" 1")
+        elif command.startswith("OUTP:GEN "):
+            self.master = command.endswith(" 1")
         else:
             voltage, current = self.setpoints[ch]
             return {
                 "*IDN?": "HAMEG,HMP4040,TEST0001,HW50020001/SW2.71",
                 "INST:NSEL?": str(ch),
                 "APPL?": f"{voltage:.3f},{current:.4f}",
-                "OUTP?": str(int(self.outputs[ch])),
+                "OUTP?": str(int(self.master and self.outputs[ch])),
+                "OUTP:SEL?": str(int(self.outputs[ch])),
+                "OUTP:GEN?": str(int(self.master)),
                 "MEAS:VOLT?": "0.000",
                 "MEAS:CURR?": "0.0000",
                 "*OPC?": "1",
@@ -224,6 +231,156 @@ async def test_cancel_connect_then_retry(bench):
         await task
     replay.override.clear()
     assert (await service.command("idn", {}, "client"))["model"] == "HMP4040"
+
+
+async def approve_test_plan(message):
+    assert "TEST0001" in message and "CH2 (2 V, 0.25 A limit)" in message
+    return True
+
+
+async def test_master_opt_in_and_fresh_single_use_approval_across_connections(bench):
+    replay, service = bench
+    replay.master = False
+    args = {"enabled": True, "channels": [2]}
+    with pytest.raises(ValueError, match="opt-in"):
+        await service.command("master_plan", args, "cli")
+    service.driver.config.allow_remote_master = True
+    preview = await service.command("master_plan", args, "cli")
+    assert not replay.master and not any(replay.outputs.values())
+    assert preview["plan"]["selected_before"] == []
+    ticket = {"confirmation": preview["confirmation"]}
+    with pytest.raises(ValueError, match="interactive"):
+        await service.command("master_apply", ticket, "client")
+    assert not replay.master and not any(replay.outputs.values())
+    preview = await service.command("master_plan", args, "cli")
+    ticket = {"confirmation": preview["confirmation"]}
+    result = await service.command(
+        "master_apply", ticket, "client", approve_master=approve_test_plan
+    )
+    assert result["master_enabled"] and replay.outputs[2] and replay.selected == 3
+    assert [r["channel"] for r in result["channels"] if r["output_state"]] == [2]
+    with pytest.raises(ValueError, match="No pending"):
+        await service.command("master_apply", ticket, "client", approve_master=approve_test_plan)
+    off = await service.command("master_plan", {"enabled": False, "channels": [2]}, "cli")
+    result = await service.command(
+        "master_apply",
+        {"confirmation": off["confirmation"]},
+        "client",
+        approve_master=approve_test_plan,
+    )
+    assert not result["master_enabled"] and not any(r["output_state"] for r in result["channels"])
+
+
+async def test_master_rejects_changed_settings_selection_limits_and_denial(bench):
+    replay, service = bench
+    replay.master = False
+    service.driver.config.allow_remote_master = True
+    async with service.session() as psu:
+        replay.outputs[4] = True
+        with pytest.raises(ValueError, match="Selected channels"):
+            await psu.master_plan(True, [2])
+        replay.outputs[4] = False
+        replay.setpoints[2] = (6, 0.25)
+        with pytest.raises(ValueError, match="limit"):
+            await psu.master_plan(True, [2])
+        replay.setpoints[2] = (2, 0.25)
+        plan = await psu.master_plan(True, [2])
+        replay.setpoints[2] = (3, 0.25)
+        with pytest.raises(ValueError, match="changed"):
+            await psu.master_apply(plan["confirmation"], approve=approve_test_plan)
+        plan = await psu.master_plan(True, [2])
+        with pytest.raises(ValueError, match="matching"):
+            await psu.master_apply("yes", approve=approve_test_plan)
+
+        async def decline(_):
+            return False
+
+        with pytest.raises(ValueError, match="did not approve"):
+            await psu.master_apply(plan["confirmation"], approve=decline)
+        assert not any(c.startswith(("OUTP:GEN ", "OUTP:SEL ")) for c in replay.commands)
+
+
+async def test_master_expiry_and_failed_enable_roll_back_staged_channels(bench, monkeypatch):
+    replay, service = bench
+    service.driver.config.allow_remote_master = True
+    replay.master = False
+    async with service.session() as psu:
+        plan = await psu.master_plan(True, [2])
+        with monkeypatch.context() as patch:
+            patch.setattr(time, "time", lambda: plan["expires_at_unix"] + 1)
+            with pytest.raises(ValueError, match="expired"):
+                await psu.master_apply(plan["confirmation"], approve=approve_test_plan)
+        plan = await psu.master_plan(True, [2])
+        replay.override["OUTP:GEN 1"] = None  # Device ignores master-on.
+        with pytest.raises(InstrumentError, match="master readback"):
+            await psu.master_apply(plan["confirmation"], approve=approve_test_plan)
+        assert not replay.master and not any(replay.outputs.values())
+        assert replay.selected == 3
+
+
+@pytest.mark.parametrize(
+    "action,field,accepted",
+    [
+        ("accept", True, True),
+        ("accept", False, False),
+        ("decline", True, False),
+        ("cancel", None, False),
+        ("accept", "true", False),
+    ],
+)
+async def test_mcp_master_requires_operator_form_acceptance(monkeypatch, action, field, accepted):
+    async def elicit_form(*, message, **kwargs):
+        assert "CH2" in message and kwargs["requestedSchema"]["required"] == ["approved"]
+        return SimpleNamespace(action=action, content={"approved": field})
+
+    session = SimpleNamespace(elicit_form=elicit_form)
+    monkeypatch.setattr(
+        mcp_server, "server", SimpleNamespace(request_context=SimpleNamespace(session=session))
+    )
+    assert await mcp_server._confirm_master("Turn on CH2?") is accepted
+
+
+async def test_disconnect_after_master_write_reports_unknown_without_retry(bench):
+    replay, service = bench
+    replay.master = False
+    replay.outputs[2] = True
+    service.driver.config.allow_remote_master = True
+    async with service.session() as psu:
+        plan = await psu.master_plan(True, [2])
+        replay.override["*OPC?"] = b""
+        with pytest.raises(InstrumentError, match="inspect physical outputs"):
+            await psu.master_apply(plan["confirmation"], approve=approve_test_plan)
+    assert replay.commands.count("OUTP:GEN 1") == 1
+    assert replay.connections == 1
+
+
+async def test_cli_preview_and_piped_confirmation_cannot_operate_master(bench, tmp_path):
+    replay, service = bench
+    service.driver.config.allow_remote_master = True
+    replay.master = False
+    config = {
+        "project": {"name": "master-test"}, "build": {"system": "test"},
+        "hardware": {"mcu": "test"},
+        "instruments": {"power_supply": service.driver.config.model_dump()},
+    }
+    path = tmp_path / "scopeloop.yaml"
+    path.write_text(json.dumps(config), encoding="utf-8")
+
+    async def cli(*args):
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "scopeloop.cli", "power", *args, "--config", str(path),
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await proc.communicate(b"yes\n")
+        return proc.returncode, out, err
+
+    code, out, err = await cli("master-plan", "on", "--channel", "2")
+    assert code == 0, err
+    plan = json.loads(out)
+    code, _, err = await cli("master-apply", plan["confirmation"])
+    assert code != 0 and b"operator terminal" in err
+    assert not any(c.startswith(("OUTP:GEN ", "OUTP:SEL ")) for c in replay.commands)
 
 
 async def test_complete_session_ownership(bench):

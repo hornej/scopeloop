@@ -186,6 +186,7 @@ class PowerSupplyConfig(BaseModel, extra="forbid"):
     port: int = Field(default=5025, ge=1, le=65535)
     timeout_seconds: float = Field(default=5, gt=0, le=60, allow_inf_nan=False)
     expected_serial: str | None = Field(default=None, min_length=1)
+    allow_remote_master: bool = False
     channels: dict[int, PowerChannelLimits] = Field(default_factory=dict)
 
     @field_validator("channels")

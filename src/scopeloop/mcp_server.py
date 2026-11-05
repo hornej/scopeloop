@@ -130,9 +130,27 @@ TOOLS = [
     _power_tool(
         "output",
         "Select or deselect one channel. Can energize its DUT if the master "
-        "is on. Leave master output control to the operator.",
+        "is on. This command does not switch the master.",
         {"channel": _POWER_CHANNEL, "enabled": {"type": "boolean"}},
         ["channel", "enabled"],
+    ),
+    _power_tool(
+        "master_plan",
+        "Preview an opt-in HMP4040 master change. Show the operator the serial, action, "
+        "selected channels and every affected setpoint. Creating a plan is not approval.",
+        {
+            "enabled": {"type": "boolean"},
+            "channels": {"type": "array", "items": _POWER_CHANNEL, "uniqueItems": True},
+        },
+        ["enabled", "channels"],
+    ),
+    _power_tool(
+        "master_apply",
+        "Apply the reviewed master change only after explicit operator approval of that "
+        "operation and its affected rails. Never treat the returned phrase as consent. "
+        "The confirmation is single use, expires after three minutes, and is revalidated.",
+        {"confirmation": {"type": "string"}},
+        ["confirmation"],
     ),
     Tool(
         name="scopeloop_evidence_export",
@@ -975,6 +993,24 @@ async def _handle_serial_stop() -> dict[str, Any]:
     }
 
 
+async def _confirm_master(message: str) -> bool:
+    session = server.request_context.session
+    elicit = getattr(session, "elicit_form", None)
+    if elicit is None:
+        raise ValueError("This MCP client needs form elicitation for master approval")
+    result = await elicit(
+        message=message,
+        requestedSchema={
+            "type": "object",
+            "properties": {
+                "approved": {"type": "boolean", "title": "Approve this master change"},
+            },
+            "required": ["approved"],
+        },
+    )
+    return result.action == "accept" and (result.content or {}).get("approved") is True
+
+
 async def _handle_power(operation: str, args: dict) -> dict:
     global _power_service
     config = _get_config()
@@ -989,7 +1025,9 @@ async def _handle_power(operation: str, args: dict) -> dict:
     if session and session.metadata.state != "running":
         session = None
     try:
-        result = await _power_service.command(operation, args, _client_id)
+        result = await _power_service.command(
+            operation, args, _client_id, approve_master=_confirm_master
+        )
     except Exception as exc:
         if session:
             await session.log_event("power_supply", operation, {"args": args, "error": str(exc)})

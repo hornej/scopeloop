@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from scopeloop.config import PowerSupplyConfig
-from scopeloop.instruments.hmp4040 import HMP4040
+from scopeloop.instruments.hmp4040 import HMP4040, MasterApproval
 from scopeloop.resources import ResourceManager, ResourceState
 from scopeloop.saleae_labels import sha256
 
@@ -44,7 +44,9 @@ class PowerSupplyService:
                 if not already_connected:
                     await self.manager.disconnect(self.key)
 
-    async def command(self, name: str, args: dict, client_id: str) -> dict:
+    async def command(
+        self, name: str, args: dict, client_id: str, *, approve_master: MasterApproval | None = None
+    ) -> dict:
         async with self.session(client_id) as supply:
             if name == "idn":
                 return asdict(await supply.get_info())
@@ -55,6 +57,10 @@ class PowerSupplyService:
                 return await supply.configure(args["channel"], args["voltage_v"], args["current_a"])
             if name == "output":
                 return await supply.output(args["channel"], args["enabled"])
+            if name == "master_plan":
+                return await supply.master_plan(args["enabled"], args["channels"])
+            if name == "master_apply":
+                return await supply.master_apply(args["confirmation"], approve=approve_master)
             raise ValueError(f"Unknown power supply command: {name}")
 
 
