@@ -52,7 +52,9 @@ Diagnostics send an in-band JSON status request. There is no Ctrl-C/REPL probing
 and no automatic reboot. Old logger firmware supports passive capture but lacks
 the new diagnostic/recovery commands.
 
-Requests begin with a newline to discard a previous client's interrupted command.
+Requests prefix the new command with a discard marker (`#` and a newline).
+This also invalidates an abandoned command whose only missing byte was the
+line terminator. Older logger firmware may report a parser error for the marker.
 Uncorrelated console-parser errors are retained in raw/timeline evidence; they
 cannot satisfy a command acknowledgement or a temperature-validity check.
 

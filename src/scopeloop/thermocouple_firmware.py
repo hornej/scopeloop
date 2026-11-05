@@ -9,7 +9,7 @@ import math
 import time
 
 PROTOCOL = "scopeloop-max31856-v1"
-FIRMWARE = "scopeloop-max31856-2"
+FIRMWARE = "scopeloop-max31856-3"
 
 
 class SensorError(Exception):
@@ -137,8 +137,10 @@ class Thermocouple:
                 fault_mask=self.sensor._read_register(15, 1)[0],
                 faults=self.sensor.fault,
             )
-            if row["fault_mask"]:
-                raise SensorError("hardware_fault", {"mask": row["fault_mask"]})
+            if row["fault_mask"] or any(row["faults"].values()):
+                raise SensorError(
+                    "hardware_fault", {"mask": row["fault_mask"], "flags": row["faults"]}
+                )
             if tc >= self.high_c or tc <= self.low_c:
                 raise SensorError("temperature_limit", {"temperature_c": tc})
             if self.recovery and self.recovery["state"] == "verifying":
@@ -250,7 +252,7 @@ def main():
                 break
             char = sys.stdin.read(1)
             if char in ("\r", "\n"):
-                if not discarding and line:
+                if not discarding and line and not line.endswith("#"):
                     try:
                         request = json.loads(line)
                         if not isinstance(request, dict):

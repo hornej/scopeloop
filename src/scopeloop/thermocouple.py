@@ -61,6 +61,7 @@ class TemperatureGuard:
         if type(sample.get("seq")) is not int or sample["seq"] < 1:
             raise ValueError("Invalid sequence")
         if self.last is not None:
+            self.check_fresh(now)
             if sample["boot"] != self.last["boot"]:
                 raise ValueError("Logger rebooted during capture")
             if sample["seq"] != self.last["seq"] + 1:
@@ -73,7 +74,7 @@ class TemperatureGuard:
         return sample
 
     def check_fresh(self, now):
-        if self.received_at is None or now - self.received_at > self.stale_s:
+        if self.received_at is None or not 0 <= now - self.received_at <= self.stale_s:
             raise ValueError("Temperature data stale/unavailable")
 
 
@@ -94,7 +95,7 @@ class ThermocoupleConnection:
             self.output.mkdir(parents=True, exist_ok=False)
             self.raw = (self.output / "serial.bin").open("xb")
             self.events = (self.output / "timeline.jsonl").open("x", encoding="utf-8")
-            self.serial = serial.Serial(port=None, baudrate=115200, timeout=0.1)
+            self.serial = serial.Serial(port=None, baudrate=115200, timeout=0.1, write_timeout=3)
             # CircuitPython CDC gates console connection/output on host DTR.
             self.serial.dtr = True
             self.serial.rts = False
@@ -152,9 +153,10 @@ class ThermocoupleConnection:
     def request(self, action, **kwargs):
         request_id = uuid.uuid4().hex
         request = {"thermocouple": action, "id": request_id, **kwargs}
-        # Discard an interrupted client's partial line before our framed request.
+        # Invalidate an abandoned command even if only its final newline is missing.
+        # Older firmware rejects the resulting line as malformed JSON.
         encoded = (
-            "\n" + json.dumps(request, allow_nan=False, separators=(",", ":")) + "\n"
+            "#\n" + json.dumps(request, allow_nan=False, separators=(",", ":")) + "\n"
         ).encode()
         self.event("tx", request)
         if self.serial.write(encoded) != len(encoded):
