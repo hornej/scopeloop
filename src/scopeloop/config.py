@@ -173,10 +173,34 @@ class LogicAnalyzerConfig(BaseModel):
     recipes: dict[str, LogicCaptureRecipeConfig] = Field(default_factory=dict)
 
 
+class PowerChannelLimits(BaseModel, extra="forbid"):
+    """Project-approved setpoint ceilings for one HMP4040 channel."""
+
+    max_voltage_v: float = Field(ge=0, le=32, allow_inf_nan=False)
+    max_current_a: float = Field(ge=0.001, le=10, allow_inf_nan=False)
+
+
+class PowerSupplyConfig(BaseModel, extra="forbid"):
+    type: Literal["hmp4040"]
+    address: str = Field(min_length=1)
+    port: int = Field(default=5025, ge=1, le=65535)
+    timeout_seconds: float = Field(default=5, gt=0, le=60, allow_inf_nan=False)
+    expected_serial: str | None = Field(default=None, min_length=1)
+    channels: dict[int, PowerChannelLimits] = Field(default_factory=dict)
+
+    @field_validator("channels")
+    @classmethod
+    def validate_channels(cls, channels: dict[int, PowerChannelLimits]):
+        if any(channel not in range(1, 5) for channel in channels):
+            raise ValueError("HMP4040 channel numbers must be 1 through 4")
+        return channels
+
+
 class InstrumentsConfig(BaseModel):
     """All instrument configurations."""
 
     oscilloscope: OscilloscopeConfig | None = None
+    power_supply: PowerSupplyConfig | None = None
     logic_analyzer: LogicAnalyzerConfig | None = None
 
 
@@ -533,6 +557,12 @@ serial:
   baud: 115200
 
 instruments:
+  # Optional raw TCP power supply. Use its front-panel Ethernet address.
+  # power_supply:
+  #   type: hmp4040
+  #   address: "192.0.2.101"
+  # Add expected_serial and project channel limits to permit control.
+  # See docs/power-supply.md.
   oscilloscope: null
   # Sigrok-based oscilloscope (recommended):
   # oscilloscope:

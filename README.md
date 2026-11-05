@@ -6,6 +6,7 @@ ScopeLoop enables AI coding assistants like Claude Code to autonomously develop 
 
 ## Bench workflows
 
+- [HMP4040 LAN setup, channel control and DC telemetry](docs/power-supply.md)
 - [Scope ripple, noise floor and load-step evidence](docs/scope-capture.md)
 - [Saleae capture, decode and native labels](docs/logic-capture.md)
 - [ngscopeclient and PulseView exports](docs/waveform-viewers.md)

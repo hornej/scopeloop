@@ -28,6 +28,10 @@ async def discover():
                 "scopeloop_logic_capture",
                 "scopeloop_logic_disconnect",
                 "scopeloop_evidence_export",
+                "scopeloop_power_idn",
+                "scopeloop_power_status",
+                "scopeloop_power_configure",
+                "scopeloop_power_output",
             ):
                 assert required in names, required
             return names
@@ -37,7 +41,7 @@ def main():
     cli = Path(sysconfig.get_path("scripts")) / (
         "scopeloop.exe" if sys.platform == "win32" else "scopeloop"
     )
-    for args in (["--help"], ["scope", "--help"], ["logic", "--help"]):
+    for args in (["--help"], ["scope", "--help"], ["logic", "--help"], ["power", "--help"]):
         result = subprocess.run([str(cli), *args], capture_output=True, timeout=20)
         if result.returncode:
             raise RuntimeError(result.stderr.decode(errors="replace"))

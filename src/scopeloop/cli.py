@@ -24,6 +24,7 @@ from scopeloop.devices import DeviceManager, DeviceMatch
 from scopeloop.host import collect_host_status, format_bytes
 from scopeloop.instruments.base import InstrumentError
 from scopeloop.logic import LogicCaptureService, parse_metadata
+from scopeloop.power_cli import app as power_app
 from scopeloop.safety import GuardrailType, SafetyConfig, SafetyGuardrails
 from scopeloop.scope import ScopeConfigError, create_scope_from_config, parse_si_value
 from scopeloop.session import SessionManager
@@ -36,6 +37,7 @@ app = typer.Typer(
 )
 
 console = Console()
+app.add_typer(power_app, name="power")
 app.add_typer(thermocouple_app, name="thermocouple")
 
 
@@ -141,6 +143,9 @@ def status(
 
     # Instruments panel
     instruments_info = []
+    if config.instruments.power_supply:
+        supply = config.instruments.power_supply
+        instruments_info.append(f"Power Supply: {supply.type} @ {supply.address}:{supply.port}")
     if config.instruments.oscilloscope:
         scope = config.instruments.oscilloscope
         instruments_info.append(f"Oscilloscope: {scope.type} @ {scope.address}")

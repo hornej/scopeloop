@@ -345,6 +345,10 @@ class ResourceManager:
             logger.info(f"Connected to resource: {resource_id}")
             self._emit_event("resource_connected", resource_id, {})
             return connection
+        except asyncio.CancelledError:
+            resource.state = ResourceState.DISCONNECTED
+            self._emit_event("resource_disconnected", resource_id, {})
+            raise
         except Exception as e:
             resource.state = ResourceState.ERROR
             resource.last_error = str(e)

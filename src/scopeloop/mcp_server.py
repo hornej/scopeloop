@@ -16,7 +16,7 @@ from typing import Any
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import TextContent, Tool, ToolAnnotations
 
 from scopeloop.comparison import compare_bundles
 from scopeloop.config import (
@@ -27,6 +27,7 @@ from scopeloop.config import (
 )
 from scopeloop.devices import DeviceManager, DeviceMatch
 from scopeloop.logic import LogicCaptureService
+from scopeloop.power import PowerSupplyService
 from scopeloop.resources import ResourceManager, TaskRLock, generate_client_id
 from scopeloop.safety import SafetyConfig, SafetyGuardrails
 from scopeloop.scope import create_scope_from_config, parse_si_value
@@ -44,6 +45,7 @@ _device_manager: DeviceManager | None = None
 _session_manager: SessionManager | None = None
 _safety: SafetyGuardrails | None = None
 _logic_service: LogicCaptureService | None = None
+_power_service: PowerSupplyService | None = None
 _logic_lifecycle_lock = TaskRLock()
 _client_id: str = generate_client_id("mcp")
 
@@ -89,7 +91,49 @@ def _get_logic_service() -> LogicCaptureService:
 # Tool Definitions
 # ============================================================================
 
+_POWER_CHANNEL = {"type": "integer", "minimum": 1, "maximum": 4}
+
+
+def _power_tool(name: str, description: str, properties: dict, required: list[str]) -> Tool:
+    return Tool(
+        name=f"scopeloop_power_{name}",
+        description=description,
+        annotations=ToolAnnotations(readOnlyHint=name == "idn"),
+        inputSchema={
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": False,
+        },
+    )
+
+
 TOOLS = [
+    _power_tool("idn", "Identify the configured HMP4040 over LAN.", {}, []),
+    _power_tool(
+        "status",
+        "Read HMP4040 setpoints, output state and DC readings. "
+        "Optionally save a hashed snapshot in a new output directory.",
+        {"channel": _POWER_CHANNEL, "output": {"type": "string"}},
+        [],
+    ),
+    _power_tool(
+        "configure",
+        "Set and verify voltage and current limit on a disabled channel.",
+        {
+            "channel": _POWER_CHANNEL,
+            "voltage_v": {"type": "number", "minimum": 0, "maximum": 32},
+            "current_a": {"type": "number", "minimum": 0.001, "maximum": 10},
+        },
+        ["channel", "voltage_v", "current_a"],
+    ),
+    _power_tool(
+        "output",
+        "Select or deselect one channel. Can energize its DUT if the master "
+        "is on. Leave master output control to the operator.",
+        {"channel": _POWER_CHANNEL, "enabled": {"type": "boolean"}},
+        ["channel", "enabled"],
+    ),
     Tool(
         name="scopeloop_evidence_export",
         description=(
@@ -579,6 +623,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
     except Exception as e:
         logger.exception(f"Error handling tool {name}")
+        if name.startswith("scopeloop_power_"):
+            raise
         return [
             TextContent(
                 type="text",
@@ -603,6 +649,8 @@ async def _handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
 async def _dispatch_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     """Route tool calls to handlers."""
 
+    if name.startswith("scopeloop_power_"):
+        return await _handle_power(name.removeprefix("scopeloop_power_"), args)
     if name == "scopeloop_evidence_export":
         from scopeloop.viewers import export_viewers
 
@@ -738,6 +786,11 @@ async def _handle_status() -> dict[str, Any]:
 
         # Instrument status
         instruments = {}
+        if config.instruments.power_supply:
+            supply = config.instruments.power_supply
+            instruments["power_supply"] = {
+                "type": supply.type, "address": supply.address, "port": supply.port,
+            }
         if config.instruments.oscilloscope:
             instruments["oscilloscope"] = {
                 "type": config.instruments.oscilloscope.type,
@@ -920,6 +973,30 @@ async def _handle_serial_stop() -> dict[str, Any]:
         "status": "not_implemented",
         "message": "Serial monitor not yet implemented",
     }
+
+
+async def _handle_power(operation: str, args: dict) -> dict:
+    global _power_service
+    config = _get_config()
+    settings = config.instruments.power_supply if config else None
+    if _power_service is None or _power_service.driver.config != settings:
+        manager = _get_resource_manager()
+        if _power_service and manager.get_resource_info(_power_service.key):
+            await manager.unregister(_power_service.key)
+        _power_service = None
+        _power_service = PowerSupplyService(settings, manager)
+    session = _session_manager.active_session if _session_manager else None
+    if session and session.metadata.state != "running":
+        session = None
+    try:
+        result = await _power_service.command(operation, args, _client_id)
+    except Exception as exc:
+        if session:
+            await session.log_event("power_supply", operation, {"args": args, "error": str(exc)})
+        raise
+    if session:
+        await session.log_event("power_supply", operation, {"args": args, "result": result})
+    return result
 
 
 async def _handle_scope_connect() -> dict[str, Any]:
@@ -1220,7 +1297,7 @@ async def _handle_session_end(args: dict[str, Any]) -> dict[str, Any]:
 async def initialize() -> None:
     """Initialize server state."""
     global _config, _resource_manager, _device_manager, _session_manager, _safety
-    global _logic_service
+    global _logic_service, _power_service
 
     logger.info("Initializing ScopeLoop MCP server...")
 
@@ -1237,6 +1314,7 @@ async def initialize() -> None:
     _device_manager = DeviceManager()
     _session_manager = SessionManager(Path("./sessions"))
     _logic_service = None
+    _power_service = None
 
     # Initialize safety with config or defaults
     safety_config = _config.safety if _config else SafetyConfig()
