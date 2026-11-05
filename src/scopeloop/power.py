@@ -61,31 +61,36 @@ class PowerSupplyService:
 async def snapshot(supply: HMP4040, channel: int | None = None, output: Path | None = None) -> dict:
     if output is None:
         return await supply.status(channel)
-    identity = asdict(await supply.get_info())
-    output.mkdir(parents=True, exist_ok=False)
-    transcript_start = len(supply.transcript)
-    manifest = {
-        "schema_version": 1,
-        "kind": "power_supply_snapshot",
-        "started_at": datetime.now(UTC).isoformat(),
-        "channel": channel,
-        "instrument": identity,
-    }
-    try:
-        result = await supply.status(channel)
-        (output / "telemetry.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
-        manifest["status"] = "complete"
-    except BaseException as exc:
-        manifest.update(status="failed", error={"type": type(exc).__name__, "message": str(exc)})
-        raise
-    finally:
-        transcript = supply.transcript[:1] + supply.transcript[transcript_start:]
-        (output / "scpi.json").write_text(json.dumps(transcript, indent=2), encoding="utf-8")
-        manifest["files"] = {path.name: sha256(path) for path in sorted(output.iterdir())}
-        manifest["completed_at"] = datetime.now(UTC).isoformat()
-        path = output / "manifest.json"
-        path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-        (output / "SHA256SUMS").write_text(
-            "".join(f"{sha256(p)}  {p.name}\n" for p in sorted(output.iterdir())), encoding="ascii"
-        )
-    return {**result, "manifest": str(path)}
+    # The transcript indices must cover only this snapshot, even across concurrent tasks.
+    async with supply._lock:
+        identity = asdict(await supply.get_info())
+        output.mkdir(parents=True, exist_ok=False)
+        transcript_start = len(supply.transcript)
+        manifest = {
+            "schema_version": 1,
+            "kind": "power_supply_snapshot",
+            "started_at": datetime.now(UTC).isoformat(),
+            "channel": channel,
+            "instrument": identity,
+        }
+        try:
+            result = await supply.status(channel)
+            (output / "telemetry.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+            manifest["status"] = "complete"
+        except BaseException as exc:
+            manifest.update(
+                status="failed", error={"type": type(exc).__name__, "message": str(exc)}
+            )
+            raise
+        finally:
+            transcript = supply.transcript[:1] + supply.transcript[transcript_start:]
+            (output / "scpi.json").write_text(json.dumps(transcript, indent=2), encoding="utf-8")
+            manifest["files"] = {path.name: sha256(path) for path in sorted(output.iterdir())}
+            manifest["completed_at"] = datetime.now(UTC).isoformat()
+            path = output / "manifest.json"
+            path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+            (output / "SHA256SUMS").write_text(
+                "".join(f"{sha256(p)}  {p.name}\n" for p in sorted(output.iterdir())),
+                encoding="ascii",
+            )
+        return {**result, "manifest": str(path)}

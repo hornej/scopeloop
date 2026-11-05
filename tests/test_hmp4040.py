@@ -138,6 +138,30 @@ async def test_enable_checks_actual_setpoint_and_scpi_errors(bench):
         assert not any(cmd.startswith(("OUTP:SEL ", "APPL ")) for cmd in replay.commands)
 
 
+async def test_pending_scpi_error_does_not_prevent_shutoff(bench):
+    replay, service = bench
+    replay.outputs[2] = True
+    replay.override["SYST:ERR?"] = '-200,"Execution error"'
+    async with service.session() as supply:
+        with pytest.raises(InstrumentError, match="Execution error"):
+            await supply.output(2, False)
+    assert "OUTP:SEL 0" in replay.commands and not replay.outputs[2]
+    assert replay.commands.index("OUTP:SEL 0") < replay.commands.index("SYST:ERR?")
+
+
+async def test_concurrent_snapshot_transcripts_are_separate(bench, tmp_path):
+    _, service = bench
+    async with service.session() as supply:
+        await asyncio.gather(*(snapshot(supply, ch, tmp_path / str(ch)) for ch in (1, 2)))
+    for ch in (1, 2):
+        transcript = json.loads((tmp_path / str(ch) / "scpi.json").read_text())
+        selected = [
+            entry["command"] for entry in transcript if entry["command"].startswith("INST:NSEL ")
+        ]
+        assert selected == [f"INST:NSEL {ch}", "INST:NSEL 3"]
+        assert sum(entry["command"] == "MEAS:VOLT?" for entry in transcript) == 1
+
+
 async def test_unverified_enable_deselects_only_target(bench):
     replay, service = bench
     replay.override["OUTP?"] = "0"

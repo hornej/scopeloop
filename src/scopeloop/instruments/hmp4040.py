@@ -163,14 +163,14 @@ class HMP4040(Instrument):
             raise InstrumentError(f"Invalid HMP4040 setpoints: {reply!r}")
         return _numeric(values[0]), _numeric(values[1])
 
-    async def _channel_status(self, channel: int) -> dict:
+    async def _channel_status(self, channel: int, output_state: bool | None = None) -> dict:
         voltage, current = await self._setpoints()
         return {
             "channel": channel,
             "timestamp": datetime.now(UTC).isoformat(),
             "voltage_set_v": voltage,
             "current_limit_a": current,
-            "output_state": await self._output_state(),
+            "output_state": await self._output_state() if output_state is None else output_state,
             "measured_voltage_v": _numeric(await self._query("MEAS:VOLT?")),
             "measured_current_a": _numeric(await self._query("MEAS:CURR?")),
         }
@@ -201,11 +201,14 @@ class HMP4040(Instrument):
         if code:
             raise InstrumentError(f"HMP4040 SCPI error: {reply}")
 
-    async def _checked_write(self, command: str) -> None:
-        await self._check_error()
+    async def _write_and_wait(self, command: str) -> None:
         await self._write(command)
         if await self._query("*OPC?") != "1":
             raise InstrumentError(f"HMP4040 completion unverified after {command}")
+
+    async def _checked_write(self, command: str) -> None:
+        await self._check_error()
+        await self._write_and_wait(command)
         await self._check_error()
 
     @serialized
@@ -223,6 +226,20 @@ class HMP4040(Instrument):
                 raise InstrumentError(f"CH{channel} unexpectedly reports its output on")
             return result
 
+    async def _disable_output(self, channel: int) -> dict:
+        # An unrelated queued error must not block an authorized shutoff.
+        await self._write_and_wait("OUTP:SEL 0")
+        state = await self._output_state()
+        try:
+            await self._check_error()
+        except InstrumentError as exc:
+            raise InstrumentError(
+                f"CH{channel} deselect sent, OUTP? returned {int(state)}. {exc}"
+            ) from exc
+        if state:
+            raise InstrumentError(f"CH{channel} disable readback failed")
+        return await self._channel_status(channel, output_state=state)
+
     @serialized
     async def output(self, channel: int, enabled: bool) -> dict:
         """Change only channel selection. The front-panel master remains operator-controlled."""
@@ -231,18 +248,15 @@ class HMP4040(Instrument):
         if not self.config.expected_serial or channel not in self.config.channels:
             raise ValueError("Channel control requires expected_serial and project channel limits")
         async with self._address_channel(channel):
-            if enabled:
-                self._check_limits(channel, *(await self._setpoints()))
-            await self._checked_write(f"OUTP:SEL {int(enabled)}")
-            if await self._output_state() != enabled:
-                if enabled:
-                    # Avoid leaving a channel selected for a later master-on.
-                    await self._checked_write("OUTP:SEL 0")
-                    if await self._output_state():
-                        raise InstrumentError(f"CH{channel} disable readback failed")
-                    raise InstrumentError(
-                        f"CH{channel} did not turn on and was deselected. "
-                        "Check the front-panel master and channel state."
-                    )
-                raise InstrumentError(f"CH{channel} disable readback failed")
-            return await self._channel_status(channel)
+            if not enabled:
+                return await self._disable_output(channel)
+            self._check_limits(channel, *(await self._setpoints()))
+            await self._checked_write("OUTP:SEL 1")
+            if await self._output_state():
+                return await self._channel_status(channel, output_state=True)
+            # Avoid leaving a channel selected for a later master-on.
+            await self._disable_output(channel)
+            raise InstrumentError(
+                f"CH{channel} did not turn on and was deselected. "
+                "Check the front-panel master and channel state."
+            )
