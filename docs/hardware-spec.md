@@ -24,6 +24,7 @@ software-defined instruments.
 | Mu host | Runs ScopeLoop, MCP/API services, drivers, captures, logs, and test recipes. |
 | Custom carrier | Provides USB/LAN, power, RP2350 control, protected I/O, trigger, and expansion connectors. |
 | RP2350 control MCU | Owns deterministic low-latency trigger, reset, relay, GPIO, and fixture-control operations. |
+| Optional timing module | Supplies reference clocks and distributes RP2350 event markers; capability depends on each instrument's inputs. |
 | Bench instruments | BYO scopes, logic analyzers, power supplies, debuggers, power profilers, cameras, and Moku devices. |
 | Fixture layer | Optional physical actuation and environmental probe modules around the DUT. |
 
@@ -38,7 +39,7 @@ flowchart LR
     storage["NVMe / Capture Storage\nwaveforms, logs, images,\nfirmware builds, evidence"]
     lan["Instrument LAN\nEthernet switch optional"]
     usb["USB Host Ports\nUSB 2.0/3.x, powered ports,\noptional per-port control"]
-    clock["Optional Clock / Sync\n10 MHz ref in/out\ntrigger in/out"]
+    clock["Optional Timing Module\nSi5351C clocks + signal buffers\nreference clocks + event markers"]
     dut["Device Under Test\npower, reset, boot,\nserial, debug, signals"]
 
     scope["Scopes / DAQ / Moku\nSCPI, USBTMC, vendor SDK"]
@@ -77,9 +78,9 @@ flowchart LR
     lan --> power
 
     rp2350 -->|"reset / boot / GPIO"| dut
-    rp2350 -->|"trigger / timestamp"| clock
-    clock -->|"trigger / 10 MHz ref where supported"| scope
-    clock -->|"trigger lines"| logic
+    rp2350 -->|"I2C setup / event markers"| clock
+    clock -->|"recorded markers / ref where supported"| scope
+    clock -->|"recorded markers / channel trigger"| logic
     clock -->|"trigger markers"| dut
 
     scope <-->|"signals / probes"| dut
@@ -95,6 +96,91 @@ flowchart LR
     sensors -->|"environment readings"| host
     actuators -->|"physical interaction"| dut
 ```
+
+## Optional Timing Module
+
+Prototype candidate: [Adafruit Si5351C 8 Channel TCXO Clock Generator,
+product 6534](https://www.adafruit.com/product/6534). The breakout provides eight
+programmable clock outputs, an onboard temperature-compensated 25 MHz reference,
+I2C control through STEMMA QT, and four optional SMA output connectors sold
+separately. The board was listed at $14.95 on 2026-11-04, before connectors,
+cables, buffers, and enclosure. Treat it as an optional prototype outside the
+base carrier estimate; ScopeLoop integration and bench timing remain unvalidated.
+
+### Division of Responsibilities
+
+| Component | Proposed responsibility |
+| --- | --- |
+| Si5351C | Generate continuous reference clocks, including 10 MHz for instruments that accept it, and periodic signals for measuring capture drift. |
+| RP2350 | Configure the generator over I2C before acquisition; generate identifiable start markers, one-shot triggers, and fixture actions using local hardware timing. |
+| Distribution circuitry | Buffer and condition reference clocks and RP2350 markers for the actual cable loads, voltage limits, and instrument inputs. |
+| ScopeLoop host | Coordinate acquisition readiness, retain ownership, save evidence, and derive alignment and timing uncertainty from recorded markers. |
+
+A reference clock can keep compatible instruments running at a common rate;
+an event marker identifies the same instant in their recordings. Both may be
+needed. I2C setup and USB/LAN command arrival are not event timing references.
+Configuring the Si5351C from the RP2350 does not lock the MCU's clock to it;
+any reference-to-MCU clock or counter path needs separate design and validation.
+
+### Proposed Acquisition Workflow
+
+1. Within one session, reserve the timing controller and all participating
+   instruments through the existing resource manager and driver leases. Hold
+   ownership from configuration through evidence saving; follow the explicit
+   bench handoff in [bench operations](bench-operations.md).
+2. Configure the clock source, PLL/divider plan, output levels, and distribution
+   before arming. Disable spread spectrum, check reference/PLL status, and keep
+   the frequency plan unchanged during the acquisition.
+3. Enable a marker channel on each instrument and establish acquisition readiness.
+   Where an API cannot prove an armed state, validate its readiness procedure and
+   verify the marker in every completed recording. An armed shot is not a capture.
+4. Have the RP2350 emit a distinctive pulse or coded marker sequence after all
+   instruments are ready, then perform only the fixture actions authorized by
+   the test. A periodic clock alone cannot identify which cycle is shared.
+5. Preserve marker and DUT signals from the same acquisition. Use the unique
+   marker for time offset and repeated shared edges over the record for relative
+   drift. Save raw evidence alongside any derived time mapping, residual error,
+   cable-delay correction, and uncertainty; preserve original sample timestamps.
+
+### Current Siglent / Saleae Limits
+
+| Instrument | Useful connection | Limitation |
+| --- | --- | --- |
+| Siglent SDS1104X-E | Record the marker on a spare analog channel and optionally trigger on that channel. | No documented 10 MHz reference input. This four-channel model has no dedicated external-trigger input; EXT on the two-channel SDS1202X-E does not apply. Its rear trigger output is an output, not a reference input. |
+| Saleae Logic Pro 16 | Record the marker on a spare digital channel and use a supported channel-edge trigger. | Samples on its internal timebase; it has no external sampling-clock mode. A recorded clock is data for alignment, not a replacement sampling clock. |
+
+These connections support alignment after capture; the two instruments retain
+independent sampling clocks. Choose marker frequency/pulse width for the actual
+enabled-channel sample rates and capture duration. Reserving a scope channel can
+change the sample rate of its paired channel. Account for sample quantization,
+thresholds, trigger latency, and cable skew when reporting timing uncertainty.
+See the [Siglent SDS1000X-E datasheet](https://siglentna.com/wp-content/uploads/dlm_uploads/2024/06/SDS1000X-E_DataSheet_EN04G.pdf)
+and [Saleae external-clock limitation](https://www.saleae.com/support/protocol-analyzers/analyzer-user-guides/using-simple-parallel).
+
+### Electrical and Software Validation
+
+The breakout's default outputs are approximately 3 Vpp CMOS clocks. Check each
+destination's voltage, waveform, impedance, and termination requirements; an SMA
+connector does not make an output a calibrated 50-ohm instrument source. For a
+shared edge, prefer a characterized buffered distribution path. Measure output
+skew, cable delay, and phase repeatability across startup and reconfiguration.
+The TCXO still has tolerance, temperature drift, and aging; exact divider ratios
+do not imply zero absolute frequency error. Clock jitter specifications do not
+establish cross-instrument synchronization accuracy. The
+[Si5351 datasheet](https://www.skyworksinc.com/-/media/Skyworks/SL/documents/public/data-sheets/Si5351-B.pdf)
+describes the clock, output, and PLL controls.
+
+Implementation still needs a Si5351C/RP2350 control path, ownership integration,
+readiness coordination, coherent scope evidence including the marker channel,
+and cross-instrument offset/drift analysis. The current scope evidence recipe
+selects one channel, and the existing logic comparison aligns separate logic
+bundles; neither is an integrated scope/Saleae synchronization service. Reuse
+the existing [scope](scope-capture.md), [logic](logic-capture.md), and
+[viewer export](waveform-viewers.md) evidence formats. Record the module identity,
+firmware/register plan, source and lock status, marker mapping, sample rates, and
+measured limits. Keep host topology in private configuration and DUT-specific
+timing requirements in the product repository. Validate a common signal on all
+participating channels before claiming any synchronization tolerance.
 
 ## Fixture Layer Definition
 
@@ -417,7 +503,9 @@ Minimum useful carrier functions:
 - RP2350 connected to the host over USB.
 - RP2350-controlled reset, boot, trigger, GPIO, and fixture-control headers.
 - Trigger input and trigger output with clear voltage limits.
-- Optional 10 MHz reference input/output path for instruments that support it.
+- Optional [timing module](#optional-timing-module) for reference clocks and
+  event-marker distribution; 10 MHz reference inputs/outputs require compatible
+  instruments and signal conditioning.
 - Qwiic/STEMMA QT I2C connector for low-speed sensors.
 - Protected low-voltage GPIO header for simple fixtures.
 - Optional module bay footprints for swappable connectivity or fixture cards.

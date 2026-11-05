@@ -161,6 +161,21 @@ def test_initialize_failure_reports_invalid_samples_instead_of_crashing():
     assert "error" in status["registers"]["0"]
 
 
+def test_late_fault_flags_during_recovery_keep_logger_latched():
+    sensor, engine = fixture()
+    sensor.regs[0] = 0
+    engine.sample()
+    assert recovery(engine)["ok"]
+    for _ in range(2):
+        engine.sample()
+    # The driver's flags come from a second register read after the raw mask.
+    sensor.fault = {"open_tc": True}
+    row = engine.sample()
+    assert row["fault_mask"] == 0
+    assert row["latched"] and not row["valid"]
+    assert row["recovery"]["state"] == "failed"
+
+
 def test_status_is_read_only_and_includes_request_identity():
     sensor, engine = fixture()
     sensor.regs[0] = 0
@@ -227,6 +242,15 @@ def test_host_rejects_identity_timing_fault_or_cutoff_change(change):
     row.update(change)
     with pytest.raises(ValueError):
         guard.accept(row, 2)
+
+
+def test_delayed_delivery_cannot_renew_freshness():
+    _, engine = fixture()
+    guard = TemperatureGuard("test-device", 110)
+    first = guard.accept(engine.sample(), 10)
+    with pytest.raises(ValueError, match="stale"):
+        guard.accept(engine.sample(), 13.1)
+    assert guard.received_at == 10 and guard.last is first
 
 
 def test_parser_rejects_nonfinite_json_and_replays_split_banner():
@@ -330,8 +354,13 @@ def test_request_resynchronizes_console_and_ignores_uncorrelated_parser_error():
     connection.event = lambda *args: None
 
     def write(data):
-        assert data.startswith(b"\n") and data.endswith(b"\n")
-        request = json.loads(data.strip())
+        # A previous client's complete command might be missing just its newline.
+        # Even a legacy receiver must reject it before parsing our status request.
+        old = b'{"thermocouple":"recover","dut_idle":true}'
+        abandoned, framed = (old + data).split(b"\n", 1)
+        with pytest.raises(ValueError):
+            json.loads(abandoned)
+        request = json.loads(framed)
         malformed = {"kind": "thermocouple", "ok": False, "error": "syntax error in JSON"}
         reply = {
             "kind": "thermocouple",
