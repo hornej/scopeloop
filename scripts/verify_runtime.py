@@ -7,6 +7,7 @@ import platform
 import subprocess
 import sys
 import sysconfig
+import tempfile
 from pathlib import Path
 
 from mcp import ClientSession, StdioServerParameters
@@ -16,10 +17,20 @@ import scopeloop
 
 
 async def discover():
+    with tempfile.TemporaryDirectory(prefix="scopeloop-runtime-") as cwd:
+        return await _discover(cwd)
+
+
+async def _discover(cwd):
     async with asyncio.timeout(20):
-        async with stdio_client(
-            StdioServerParameters(command=sys.executable, args=["-m", "scopeloop.mcp_server"])
-        ) as (reader, writer), ClientSession(reader, writer) as client:
+        async with (
+            stdio_client(
+                StdioServerParameters(
+                    command=sys.executable, args=["-m", "scopeloop.mcp_server"], cwd=cwd
+                )
+            ) as (reader, writer),
+            ClientSession(reader, writer) as client,
+        ):
             await client.initialize()
             result = await client.list_tools()
             names = sorted(tool.name for tool in result.tools)
@@ -39,6 +50,10 @@ async def discover():
                 "scopeloop_hantek_loopback",
             ):
                 assert required in names, required
+            started = await client.call_tool("scopeloop_session_start", {})
+            assert not started.isError and json.loads(started.content[0].text)["started"]
+            ended = await client.call_tool("scopeloop_session_end", {"outcome": "success"})
+            assert not ended.isError
             return names
 
 
@@ -46,8 +61,13 @@ def main():
     cli = Path(sysconfig.get_path("scripts")) / (
         "scopeloop.exe" if sys.platform == "win32" else "scopeloop"
     )
-    for args in (["--help"], ["scope", "--help"], ["logic", "--help"], ["power", "--help"],
-                 ["hantek", "--help"]):
+    for args in (
+        ["--help"],
+        ["scope", "--help"],
+        ["logic", "--help"],
+        ["power", "--help"],
+        ["hantek", "--help"],
+    ):
         result = subprocess.run([str(cli), *args], capture_output=True, timeout=20)
         if result.returncode:
             raise RuntimeError(result.stderr.decode(errors="replace"))
