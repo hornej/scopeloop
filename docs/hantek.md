@@ -37,10 +37,34 @@ idle handoff and Windows administrator approval.
 
 Linux has an optional `pip install 'scopeloop[hantek]'` PyUSB transport requiring
 host-provided libusb and USB permissions. It does not detach kernel drivers,
-reset USB or update firmware. This transport has not been qualified on hardware.
-The live qualification is Windows x64, Hantek 2D72 firmware `2021090901`; family
-identity is readable, but exact model readback is unavailable. Other 2000-series
-models and firmware need separate qualification.
+reset USB or update firmware. The same 100 Hz AC/DC loopback and passive capture
+have passed on Windows x64 and Raspberry Pi ARM64 with Debian 13, Python 3.13.5,
+PyUSB 1.3.1 and libusb 1.0.28. The tested instrument is a Hantek 2D72 with firmware
+`2021090901`; family identity is readable, but exact model readback is unavailable.
+Other models, firmware and electrical modes need separate qualification.
+
+For headless Linux, give the instrument host user access through an existing
+group such as `plugdev`. A narrow udev rule can use:
+
+```udev
+SUBSYSTEM=="usb", ATTR{idVendor}=="0483", ATTR{idProduct}=="2d42", GROUP="plugdev", MODE="0660"
+```
+
+Reload the rules and apply a `change` event only to the identified Hantek device,
+or reconnect that device. Do not reset a shared USB hub. Verify read/write access
+as the ordinary instrument-host user and confirm the serial via `hantek status`.
+The protocol serial is distinct from this firmware's unusual USB string serial;
+prefer `expected_serial` for identity checking. Existing bench environments can
+remain installed while the Hantek uses its own versioned virtualenv.
+
+For remote MCP, run stdio through SSH without a pseudo-terminal, with the server
+working directory set to the private host configuration. On Windows, OpenSSH
+requires `PROGRAMDATA` in the launch environment; MCP clients that filter it out
+can cause SSH to exit 255 without diagnostics. Pass that variable explicitly and
+test the actual configured command, not only a shell SSH session. Paths supplied
+to remote tools refer to the instrument host. If its wall clock is unsynchronized,
+record the client clock alongside the evidence instead of treating host timestamps
+as accurate absolute time. Bounded test durations use monotonic time.
 
 ## Commands and MCP
 
