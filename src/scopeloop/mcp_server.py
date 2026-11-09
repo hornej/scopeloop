@@ -26,6 +26,8 @@ from scopeloop.config import (
     load_config,
 )
 from scopeloop.devices import DeviceManager, DeviceMatch
+from scopeloop.hantek import HantekService
+from scopeloop.hantek_mcp import TOOLS as HANTEK_TOOLS
 from scopeloop.logic import LogicCaptureService
 from scopeloop.power import PowerSupplyService
 from scopeloop.resources import ResourceManager, TaskRLock, generate_client_id
@@ -46,6 +48,7 @@ _session_manager: SessionManager | None = None
 _safety: SafetyGuardrails | None = None
 _logic_service: LogicCaptureService | None = None
 _power_service: PowerSupplyService | None = None
+_hantek_service: HantekService | None = None
 _logic_lifecycle_lock = TaskRLock()
 _client_id: str = generate_client_id("mcp")
 
@@ -109,6 +112,7 @@ def _power_tool(name: str, description: str, properties: dict, required: list[st
 
 
 TOOLS = [
+    *HANTEK_TOOLS,
     _power_tool("idn", "Identify the configured HMP4040 over LAN.", {}, []),
     _power_tool(
         "status",
@@ -641,7 +645,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
     except Exception as e:
         logger.exception(f"Error handling tool {name}")
-        if name.startswith("scopeloop_power_"):
+        if name.startswith(("scopeloop_power_", "scopeloop_hantek_")):
             raise
         return [
             TextContent(
@@ -658,7 +662,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
 async def _handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     """Keep configuration replacement serialized with persistent Logic operations."""
-    if name == "scopeloop_init" or name.startswith("scopeloop_logic_"):
+    if name == "scopeloop_init" or name.startswith(("scopeloop_logic_", "scopeloop_hantek_")):
         async with _logic_lifecycle_lock:
             return await _dispatch_tool(name, args)
     return await _dispatch_tool(name, args)
@@ -669,6 +673,8 @@ async def _dispatch_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
 
     if name.startswith("scopeloop_power_"):
         return await _handle_power(name.removeprefix("scopeloop_power_"), args)
+    if name.startswith("scopeloop_hantek_"):
+        return await _handle_hantek(name.removeprefix("scopeloop_hantek_"), args)
     if name == "scopeloop_evidence_export":
         from scopeloop.viewers import export_viewers
 
@@ -804,6 +810,12 @@ async def _handle_status() -> dict[str, Any]:
 
         # Instrument status
         instruments = {}
+        if config.instruments.hantek:
+            instruments["hantek"] = {
+                "type": config.instruments.hantek.type,
+                "transport": config.instruments.hantek.transport,
+                "capabilities": ["scope", "dmm", "awg"], "connection": "on_demand",
+            }
         if config.instruments.power_supply:
             supply = config.instruments.power_supply
             instruments["power_supply"] = {
@@ -1034,6 +1046,30 @@ async def _handle_power(operation: str, args: dict) -> dict:
         raise
     if session:
         await session.log_event("power_supply", operation, {"args": args, "result": result})
+    return result
+
+
+async def _handle_hantek(operation: str, args: dict) -> dict:
+    global _hantek_service
+    config = _get_config()
+    settings = config.instruments.hantek if config else None
+    if _hantek_service is None or _hantek_service.driver.config != settings:
+        manager = _get_resource_manager()
+        if _hantek_service and manager.get_resource_info(_hantek_service.key):
+            await manager.unregister(_hantek_service.key)
+        _hantek_service = None
+        _hantek_service = HantekService(settings, manager)
+    session = _session_manager.active_session if _session_manager else None
+    if session and session.metadata.state != "running":
+        session = None
+    try:
+        result = await _hantek_service.command(operation, args, _client_id)
+    except Exception as exc:
+        if session:
+            await session.log_event("hantek", operation, {"args": args, "error": str(exc)})
+        raise
+    if session:
+        await session.log_event("hantek", operation, {"args": args, "result": result})
     return result
 
 
@@ -1335,7 +1371,7 @@ async def _handle_session_end(args: dict[str, Any]) -> dict[str, Any]:
 async def initialize() -> None:
     """Initialize server state."""
     global _config, _resource_manager, _device_manager, _session_manager, _safety
-    global _logic_service, _power_service
+    global _logic_service, _power_service, _hantek_service
 
     logger.info("Initializing ScopeLoop MCP server...")
 
@@ -1353,6 +1389,7 @@ async def initialize() -> None:
     _session_manager = SessionManager(Path("./sessions"))
     _logic_service = None
     _power_service = None
+    _hantek_service = None
 
     # Initialize safety with config or defaults
     safety_config = _config.safety if _config else SafetyConfig()

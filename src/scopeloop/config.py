@@ -197,10 +197,24 @@ class PowerSupplyConfig(BaseModel, extra="forbid"):
         return channels
 
 
+class HantekConfig(BaseModel):
+    """One combined Hantek scope/DMM/AWG, sharing one connection and lease."""
+
+    type: Literal["hantek-2000"] = "hantek-2000"
+    transport: Literal["auto", "winusb", "libusb"] = "auto"
+    usb_path: str | None = None
+    usb_serial: str | None = None
+    expected_serial: str | None = None
+    timeout_ms: int = Field(default=1500, ge=100, le=10000)
+    max_output_peak_v: float = Field(default=2.5, gt=0, le=2.5, allow_inf_nan=False)
+    scope_zero_reference: str | None = None
+
+
 class InstrumentsConfig(BaseModel):
     """All instrument configurations."""
 
     oscilloscope: OscilloscopeConfig | None = None
+    hantek: HantekConfig | None = None
     power_supply: PowerSupplyConfig | None = None
     logic_analyzer: LogicAnalyzerConfig | None = None
 

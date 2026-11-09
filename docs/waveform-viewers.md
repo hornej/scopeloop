@@ -4,6 +4,10 @@ Use these viewers for interactive analysis of ScopeLoop's saved evidence.
 ScopeLoop retains acquisition ownership, settings and raw artifacts; exported
 files let a human inspect the same capture without another instrument connection.
 
+[Hantek captures](hantek.md) with a matching saved zero reference can use the
+same exports, labelled as nominal volts. Raw-only ADC bundles cannot be exported
+as volts. Each scope subdirectory of a Hantek loopback is a standalone source bundle.
+
 ```sh
 scopeloop evidence export capture-bundle viewer-files
 # Raise the expansion budget deliberately for longer digital recordings:

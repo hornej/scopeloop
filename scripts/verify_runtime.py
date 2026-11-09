@@ -32,6 +32,11 @@ async def discover():
                 "scopeloop_power_status",
                 "scopeloop_power_configure",
                 "scopeloop_power_output",
+                "scopeloop_hantek_status",
+                "scopeloop_hantek_dmm_read",
+                "scopeloop_hantek_awg_run",
+                "scopeloop_hantek_scope_capture",
+                "scopeloop_hantek_loopback",
             ):
                 assert required in names, required
             return names
@@ -41,7 +46,8 @@ def main():
     cli = Path(sysconfig.get_path("scripts")) / (
         "scopeloop.exe" if sys.platform == "win32" else "scopeloop"
     )
-    for args in (["--help"], ["scope", "--help"], ["logic", "--help"], ["power", "--help"]):
+    for args in (["--help"], ["scope", "--help"], ["logic", "--help"], ["power", "--help"],
+                 ["hantek", "--help"]):
         result = subprocess.run([str(cli), *args], capture_output=True, timeout=20)
         if result.returncode:
             raise RuntimeError(result.stderr.decode(errors="replace"))

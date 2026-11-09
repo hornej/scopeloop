@@ -14,6 +14,10 @@ deployment switch. Staging and offline tests can proceed independently.
 - For scope acquisition, read `docs/scope-capture.md`. Use fresh AUTO for DC/ripple,
   SINGLE for an external event, and save raw data with setup, identity and hashes.
   Reject empty/truncated data. Record clipping, noise floor and probing limits.
+- For Hantek 2000 USB, read `docs/hantek.md`. Use the shared scope/DMM/AWG lease,
+  bounded output runs and hashed evidence. Output readbacks are setpoints, not
+  physical enable state. Scope voltage exports require a matching saved zero
+  reference and remain nominal; do not claim calibrated ripple or single-shot freshness.
 - For Saleae, read `docs/logic-capture.md`. Reuse the recipe service. Preserve the
   original SAL, make a labeled copy, reopen/resave it in Logic, and verify native
   labels before claiming them. A sidecar alone is not a labeled native capture.
