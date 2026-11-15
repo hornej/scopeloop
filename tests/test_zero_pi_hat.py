@@ -284,4 +284,3 @@ async def test_real_socket_client_disconnect_keeps_gpio_off(config):
         with pytest.raises(asyncio.CancelledError):
             await task
     assert not Path(config.socket_path).exists()
-

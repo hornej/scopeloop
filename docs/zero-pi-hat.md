@@ -113,3 +113,5 @@ The implementation is covered by fake-GPIO state, fault, ownership,
 cancellation and Linux socket tests. The new owner has not yet been qualified
 by switching the live bench; prior physical measurements validate the mapping
 and electrical behavior, not every path in this new service.
+See the [implementation verification record](zero-pi-hat-validation-2026-11-14.md)
+for installed-wheel tests, hashes and remaining physical checks.
