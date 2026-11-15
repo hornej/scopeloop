@@ -44,6 +44,31 @@ class FakeManager:
 
 
 @pytest.mark.asyncio
+async def test_analog_only_timed_capture_without_digital_rate(monkeypatch):
+    monkeypatch.setattr(saleae_module, "SALEAE_AVAILABLE", True)
+    for name in ("LogicDeviceConfiguration", "CaptureConfiguration", "TimedCaptureMode"):
+        monkeypatch.setattr(saleae_module, name, lambda **kwargs: SimpleNamespace(**kwargs),
+                            raising=False)
+    analyzer = saleae_module.SaleaeLogicAnalyzer()
+    manager = FakeManager()
+    analyzer._manager = manager
+    analyzer._device = SimpleNamespace(device_id="FAKE")
+    analyzer._connected = True
+
+    async def no_wait(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(analyzer, "_wait_for_capture", no_wait)
+    result = await analyzer.capture(.1, [], [8], sample_rate_digital=None,
+                                    sample_rate_analog=50_000_000)
+    device = manager.kwargs["device_configuration"]
+    assert device.digital_sample_rate is None and device.enabled_digital_channels == []
+    assert device.analog_sample_rate == 50_000_000 and result.sample_rate_digital is None
+    with pytest.raises(saleae_module.InstrumentError, match="requires sample_rate_analog"):
+        await analyzer.capture(.1, [], [8], sample_rate_digital=None)
+
+
+@pytest.mark.asyncio
 async def test_trigger_uses_trim_for_real_pretrigger_and_keeps_analog(monkeypatch):
     monkeypatch.setattr(saleae_module, "SALEAE_AVAILABLE", True)
     monkeypatch.setattr(

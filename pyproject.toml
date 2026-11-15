@@ -54,6 +54,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+zero-pi-hat = [
+    "gpiod>=2.2,<3; sys_platform == 'linux'",
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",

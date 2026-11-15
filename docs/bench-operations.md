@@ -15,6 +15,18 @@ Keep those clients under the same explicit bench handoff. For multi-instrument
 tests retain driver connections throughout the run, inside the existing session;
 do not release ownership between configuration and capture.
 
+For [Zero Pi HAT v0.1.0](zero-pi-hat.md), a persistent local owner holds the
+GPIO request across CLI/MCP calls. Client disconnect must not release a
+power-off hold. The board defaults on when its enable is released, so process
+shutdown is not synonymous with rail shutdown. Instrument services should
+publish final commanded state before acknowledging shutdown and distinguish
+closed connection, commanded state and measured load voltage.
+
+When removing DUT power, include signal connections in the shutdown plan.
+The composite-video bench retained DC on its source lead even after encoder
+disable; physical disconnection removed it. A stopped application or disabled
+video mode alone does not establish an electrically isolated load.
+
 ## Device diagnostics
 
 `scopeloop diagnose-device --serial SERIAL` reports `present`, `absent`,

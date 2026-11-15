@@ -539,7 +539,7 @@ class SaleaeLogicAnalyzer(Instrument):
         duration: float,
         digital_channels: list[int],
         analog_channels: list[int] | None = None,
-        sample_rate_digital: int = 10_000_000,
+        sample_rate_digital: int | None = 10_000_000,
         sample_rate_analog: int | None = None,
         voltage_threshold: VoltageThreshold = VoltageThreshold.V_3_3,
         glitch_filter_ns: int | None = None,
@@ -565,6 +565,8 @@ class SaleaeLogicAnalyzer(Instrument):
 
         analog_channels = analog_channels or []
         if analog_channels and sample_rate_analog is None:
+            if sample_rate_digital is None:
+                raise InstrumentError("Analog-only capture requires sample_rate_analog")
             sample_rate_analog = sample_rate_digital // 10
         self._validate_capture_request(
             digital_channels,
@@ -602,8 +604,9 @@ class SaleaeLogicAnalyzer(Instrument):
         )
 
         logger.info(
-            f"Starting capture: {duration}s, channels {digital_channels}, "
-            f"sample rate {sample_rate_digital / 1e6:.1f} MHz"
+            "Starting capture: %ss, digital=%s@%s Hz, analog=%s@%s Hz",
+            duration, digital_channels, device_args["digital_sample_rate"],
+            analog_channels, device_args["analog_sample_rate"],
         )
 
         # Start capture (blocking)

@@ -109,6 +109,31 @@ def _power_tool(name: str, description: str, properties: dict, required: list[st
 
 
 TOOLS = [
+    Tool(
+        name="scopeloop_hat_status",
+        description="Read the local Zero Pi HAT owner's GPIO/fault state; "
+                    "rail voltage is unmeasured.",
+        annotations=ToolAnnotations(readOnlyHint=True),
+        inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
+    ),
+    Tool(
+        name="scopeloop_hat_output",
+        description="Set the configured HAT's shared 12 V output via its persistent Pi owner. "
+                    "Affects every configured load; may energize hardware.",
+        annotations=ToolAnnotations(readOnlyHint=False),
+        inputSchema={"type": "object", "properties": {"enabled": {"type": "boolean"}},
+                     "required": ["enabled"], "additionalProperties": False},
+    ),
+    Tool(
+        name="scopeloop_hat_cycle",
+        description="Cycle an already-enabled HAT output. The owner holds GPIO across the cycle; "
+                    "does not enable an already-off output.",
+        annotations=ToolAnnotations(readOnlyHint=False),
+        inputSchema={"type": "object", "properties": {
+            "off_seconds": {"type": "number", "minimum": 0.5, "maximum": 10},
+            "settle_seconds": {"type": "number", "minimum": 0, "maximum": 10}},
+            "additionalProperties": False},
+    ),
     _power_tool("idn", "Identify the configured HMP4040 over LAN.", {}, []),
     _power_tool(
         "status",
@@ -623,7 +648,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
     except Exception as e:
         logger.exception(f"Error handling tool {name}")
-        if name.startswith("scopeloop_power_"):
+        if name.startswith(("scopeloop_power_", "scopeloop_hat_")):
             raise
         return [
             TextContent(
@@ -649,6 +674,21 @@ async def _handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
 async def _dispatch_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     """Route tool calls to handlers."""
 
+    if name.startswith("scopeloop_hat_"):
+        from scopeloop.zero_pi_hat import command
+
+        config = _get_config()
+        operation = name.removeprefix("scopeloop_hat_")
+        session = _session_manager.active_session if _session_manager else None
+        try:
+            result = await command(config.zero_pi_hat if config else None, operation, **args)
+        except Exception as exc:
+            if session and session.metadata.state == "running":
+                await session.log_event("zero_pi_hat", operation, {"args": args, "error": str(exc)})
+            raise
+        if session and session.metadata.state == "running":
+            await session.log_event("zero_pi_hat", operation, {"args": args, "result": result})
+        return result
     if name.startswith("scopeloop_power_"):
         return await _handle_power(name.removeprefix("scopeloop_power_"), args)
     if name == "scopeloop_evidence_export":
