@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from click import unstyle
 from pydantic import ValidationError
 from typer.testing import CliRunner
 
@@ -221,7 +222,7 @@ def test_cli_requires_explicit_initial_off_and_exposes_commands(config, tmp_path
     path = tmp_path / "fixture.json"
     path.write_text(project_config(config).model_dump_json())
     result = CliRunner().invoke(app, ["serve", "--config", str(path)])
-    assert result.exit_code != 0 and "--start-off" in result.output
+    assert result.exit_code != 0 and "--start-off" in unstyle(result.output)
     result = CliRunner().invoke(app, ["--help"])
     assert result.exit_code == 0
     assert all(name in result.output for name in ["inspect", "serve", "output", "cycle", "status"])
