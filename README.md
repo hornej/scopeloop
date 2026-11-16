@@ -144,6 +144,10 @@ want direct scripted captures.
 See [docs/host-setup.md](docs/host-setup.md) for macOS, Windows, and dedicated
 LattePanda Mu host setup notes.
 
+See [electronic-load fault recovery](docs/electronic-load.md) for the Rigol
+DL3021A / DL3000 remote reverse-connection alarm acknowledgment procedure and
+its bench-validation limits.
+
 ## Fixture Layer
 
 ScopeLoop separates calibrated bench instruments from physical test fixtures.
