@@ -14,6 +14,10 @@ deployment switch. Staging and offline tests can proceed independently.
 - For scope acquisition, read `docs/scope-capture.md`. Use fresh AUTO for DC/ripple,
   SINGLE for an external event, and save raw data with setup, identity and hashes.
   Reject empty/truncated data. Record clipping, noise floor and probing limits.
+- For Hantek 2000 USB, read `docs/hantek.md`. Use the shared scope/DMM/AWG lease,
+  bounded output runs and hashed evidence. Output readbacks are setpoints, not
+  physical enable state. Scope voltage exports require a matching saved zero
+  reference and remain nominal; do not claim calibrated ripple or single-shot freshness.
 - For Saleae, read `docs/logic-capture.md`. Reuse the recipe service. Preserve the
   original SAL, make a labeled copy, reopen/resave it in Logic, and verify native
   labels before claiming them. A sidecar alone is not a labeled native capture.
@@ -22,7 +26,9 @@ deployment switch. Staging and offline tests can proceed independently.
   Distinguish absent device, enumeration failure and application unresponsiveness.
 - For the HMP4040, read `docs/power-supply.md`. Start with identity and a DC
   snapshot. Setpoints and channel selection require authorization for the
-  specific DUT and channel. Keep the master under front-panel control.
+  specific DUT and channel. The master defaults to the front panel. In projects
+  that opt in, use the master preview and operator-confirmed apply workflow.
+  Show the exact affected rails and setpoints. A preview token alone is not approval.
 - For Zero Pi HAT control, read `docs/zero-pi-hat.md`. Inspect the revision,
   Pi identity and all shared-output loads. Keep the persistent GPIO owner alive:
   releasing this board's enable can turn power on. Never take over an existing

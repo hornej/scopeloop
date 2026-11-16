@@ -103,6 +103,9 @@ class GitState:
             # Get current commit hash
             result = await asyncio.create_subprocess_exec(
                 "git", "rev-parse", "HEAD",
+                # Git for Windows can block during MSYS pipe initialization if
+                # it inherits the MCP server's overlapped stdin pipe.
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 cwd=cwd,
@@ -113,6 +116,7 @@ class GitState:
             # Get current branch
             result = await asyncio.create_subprocess_exec(
                 "git", "rev-parse", "--abbrev-ref", "HEAD",
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 cwd=cwd,
@@ -123,6 +127,7 @@ class GitState:
             # Get dirty files
             result = await asyncio.create_subprocess_exec(
                 "git", "status", "--porcelain",
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 cwd=cwd,

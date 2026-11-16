@@ -1,5 +1,9 @@
 # Scope acquisition and evidence
 
+For Hantek USB AUTO snapshots and the shared DMM/AWG, use the separate
+[Hantek workflow](hantek.md). The qualified Siglent capture procedure below does
+not establish Hantek calibration or single-shot freshness.
+
 `scopeloop scope capture recipe.json new-evidence-directory --config bench.yaml`
 and MCP `scopeloop_scope_capture` use the same evidence routine. The MCP inputs
 are `recipe` (the object below) and `output` (a new directory on the instrument host).

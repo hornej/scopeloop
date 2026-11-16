@@ -7,6 +7,7 @@ ScopeLoop enables AI coding assistants like Claude Code to autonomously develop 
 ## Bench workflows
 
 - [Zero Pi HAT v0.1.0 shared-output control](docs/zero-pi-hat.md)
+- [Hantek 2000 USB scope, DMM and generator](docs/hantek.md)
 - [HMP4040 LAN setup, channel control and DC telemetry](docs/power-supply.md)
 - [Scope ripple, noise floor and load-step evidence](docs/scope-capture.md)
 - [Saleae capture, decode and native labels](docs/logic-capture.md)
@@ -22,6 +23,7 @@ ScopeLoop enables AI coding assistants like Claude Code to autonomously develop 
 - **Build & Flash**: Automated firmware building (ESP-IDF) and flashing (esptool)
 - **Serial Monitoring**: Capture and analyze serial output with timestamped logs
 - **Oscilloscope Control**: Siglent SDS1000X-E integration for waveform capture and measurement
+- **USB Bench Instrument**: Hantek 2000 scope snapshots, DMM readback and bounded AWG control
 - **Logic Analyzer**: Saleae Logic 2 integration for digital signal analysis
 - **Offline Viewers**: Verified evidence exports to ngscopeclient CSV and native PulseView sessions
 - **Fixture Layer**: Model relays, Qwiic sensors, cameras, probes, and custom DUT actuation
@@ -142,6 +144,10 @@ want direct scripted captures.
 
 See [docs/host-setup.md](docs/host-setup.md) for macOS, Windows, and dedicated
 LattePanda Mu host setup notes.
+
+See [electronic-load fault recovery](docs/electronic-load.md) for the Rigol
+DL3021A / DL3000 remote reverse-connection alarm acknowledgment procedure and
+its bench-validation limits.
 
 ## Fixture Layer
 

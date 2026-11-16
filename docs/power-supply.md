@@ -4,7 +4,7 @@ Use the HMP4040's raw SCPI Ethernet socket from the machine that owns the bench.
 On the front panel, open **Menu → Interface → Ethernet** and read the current
 IP address and port. Enter IPv4 octets without leading zeroes. The usual port
 is 5025. This driver uses Python's TCP support and needs no VISA backend or
-vendor software. [R&S HMP Series User Manual, chapters 7–8](https://scdn.rohde-schwarz.com/ur/pws/dl_downloads/pdm/cl_manuals/user_manual/1178_6833_01/HMPSeries_UserManual_en_04.pdf)
+vendor software. [R&S HMP Series User Manual, chapters 7–8](https://scdn.rohde-schwarz.com/ur/pws/dl_downloads/pdm/cl_manuals/user_manual/1178_6833_01/HMPSeries_UserManual_en_03.pdf)
 
 ## First read
 
@@ -62,12 +62,40 @@ scopeloop power output 2 on
 scopeloop power output 2 off
 ```
 
-Channel control uses `OUTP:SEL`. The operator owns the master output switch.
+Channel control uses `OUTP:SEL`. The front panel controls the master by default.
 Before enabling the master on the panel, check every selected channel. Once
 the master is on, selecting one channel can immediately energize that rail.
 Status returns the instrument's `OUTP?` reply. Check measured voltage as well.
 On an unexpected readback or interrupted command, inspect the instrument before
 retrying. Closing a connection releases ownership without issuing output commands.
+
+## Remote master with operator approval
+
+To permit remote master control in a private project, set
+`instruments.power_supply.allow_remote_master: true`, pin `expected_serial`, and
+configure voltage and current ceilings for each channel to energize.
+
+```console
+scopeloop power master-plan on --channel 2
+scopeloop power master-apply "APPROVE MASTER ON <nonce from preview>"
+```
+
+The preview reads the current master, channel selections and setpoints. It creates a
+single-use request for this instrument host that expires in three minutes. In the
+operator terminal, apply displays the action, serial, affected channels, voltages and
+current limits and asks for confirmation. With MCP, use `scopeloop_power_master_plan`
+and `scopeloop_power_master_apply`. The client must display a form and receive an
+explicit positive answer from the operator. A headless CLI or a client without form
+support cannot approve a change. A preview or its token alone cannot operate the switch.
+
+For master-on, specify exactly the channels intended to receive power. With the master
+off, ScopeLoop can select missing approved channels before enabling it. An unexpected
+selected channel, changed setpoint, expired/reused request, or exceeded project limit
+requires a new review. Master-off affects every selected channel and requires the same
+approval process. Software rechecks before writing and reports the actual outputs
+afterward. If transport fails during a write, inspect the supply before retrying.
+The host lease coordinates ScopeLoop clients. Keep front-panel and other raw SCPI
+clients idle while applying the reviewed change.
 
 ## Firmware tests and MCP
 
@@ -90,7 +118,8 @@ async def measure_boot(run_boot_step, session_dir):
 
 Start the stdio MCP server from the private config directory using the installed
 environment's `python -m scopeloop.mcp_server`. It exposes `scopeloop_power_idn`,
-`scopeloop_power_status`, `scopeloop_power_configure` and `scopeloop_power_output`.
+`scopeloop_power_status`, `scopeloop_power_configure`, `scopeloop_power_output`, and
+the two remote-master tools described above.
 For example, ask “Read CH2 voltage and current and save a snapshot in
 `captures/power-before-boot`.” Each tool call releases the supply when it
 finishes and logs its result to a running ScopeLoop session. For a sequence

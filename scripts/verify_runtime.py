@@ -7,6 +7,7 @@ import platform
 import subprocess
 import sys
 import sysconfig
+import tempfile
 from pathlib import Path
 
 from mcp import ClientSession, StdioServerParameters
@@ -16,10 +17,20 @@ import scopeloop
 
 
 async def discover():
+    with tempfile.TemporaryDirectory(prefix="scopeloop-runtime-") as cwd:
+        return await _discover(cwd)
+
+
+async def _discover(cwd):
     async with asyncio.timeout(20):
-        async with stdio_client(
-            StdioServerParameters(command=sys.executable, args=["-m", "scopeloop.mcp_server"])
-        ) as (reader, writer), ClientSession(reader, writer) as client:
+        async with (
+            stdio_client(
+                StdioServerParameters(
+                    command=sys.executable, args=["-m", "scopeloop.mcp_server"], cwd=cwd
+                )
+            ) as (reader, writer),
+            ClientSession(reader, writer) as client,
+        ):
             await client.initialize()
             result = await client.list_tools()
             names = sorted(tool.name for tool in result.tools)
@@ -35,8 +46,17 @@ async def discover():
                 "scopeloop_hat_status",
                 "scopeloop_hat_output",
                 "scopeloop_hat_cycle",
+                "scopeloop_hantek_status",
+                "scopeloop_hantek_dmm_read",
+                "scopeloop_hantek_awg_run",
+                "scopeloop_hantek_scope_capture",
+                "scopeloop_hantek_loopback",
             ):
                 assert required in names, required
+            started = await client.call_tool("scopeloop_session_start", {})
+            assert not started.isError and json.loads(started.content[0].text)["started"]
+            ended = await client.call_tool("scopeloop_session_end", {"outcome": "success"})
+            assert not ended.isError
             return names
 
 
@@ -45,8 +65,12 @@ def main():
         "scopeloop.exe" if sys.platform == "win32" else "scopeloop"
     )
     for args in (
-        ["--help"], ["scope", "--help"], ["logic", "--help"],
-        ["power", "--help"], ["hat", "--help"],
+        ["--help"],
+        ["scope", "--help"],
+        ["logic", "--help"],
+        ["power", "--help"],
+        ["hantek", "--help"],
+        ["hat", "--help"],
     ):
         result = subprocess.run([str(cli), *args], capture_output=True, timeout=20)
         if result.returncode:

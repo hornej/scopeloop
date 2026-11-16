@@ -177,6 +177,8 @@ def export_viewers(bundle: Path, output: Path, max_samples: int = 50_000_000) ->
     if output == bundle or bundle in output.parents:
         raise ValueError("Viewer output must be outside the immutable source bundle")
     manifest = validate_bundle(bundle)
+    if manifest.get("kind", "").startswith("hantek_") and "waveform" not in manifest:
+        raise ValueError("Viewer export requires a zero-referenced Hantek scope capture")
     traces = []
     if "waveform" in manifest:
         require_artifact(manifest, "waveform.npz")

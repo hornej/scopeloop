@@ -3,16 +3,39 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
+import secrets
 import socket
-from collections.abc import AsyncIterator
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict
 from datetime import UTC, datetime
+from pathlib import Path
 
 from scopeloop.config import PowerSupplyConfig
 from scopeloop.instruments.base import Instrument, InstrumentError, InstrumentInfo
 from scopeloop.resources import HostLease, TaskRLock, serialized
+
+MasterApproval = Callable[[str], Awaitable[bool]]
+
+
+def describe_master_plan(plan: dict) -> str:
+    action = "ON" if plan["master_after"] else "OFF"
+    rails = (
+        ", ".join(
+            f"CH{r['channel']} ({r['voltage_v']:g} V, {r['current_limit_a']:g} A limit)"
+            for r in plan["channels"]
+        )
+        or "no channels"
+    )
+    before = "on" if plan["master_before"] else "off"
+    selected = ", ".join(f"CH{ch}" for ch in plan["selected_before"]) or "none"
+    return (
+        f"HMP4040 {plan['serial']}: master currently {before}, selected channels {selected}. "
+        f"Switch master {action} for {rails}?"
+    )
 
 
 def _numeric(reply: str) -> float:
@@ -150,10 +173,10 @@ class HMP4040(Instrument):
             if original != channel and self.is_connected:
                 await self._select(original)
 
-    async def _output_state(self) -> bool:
-        reply = await self._query("OUTP?")
+    async def _output_state(self, query: str = "OUTP?") -> bool:
+        reply = await self._query(query)
         if reply not in {"0", "1"}:
-            raise InstrumentError(f"Invalid HMP4040 output state: {reply!r}")
+            raise InstrumentError(f"Invalid HMP4040 {query} state: {reply!r}")
         return reply == "1"
 
     async def _setpoints(self) -> tuple[float, float]:
@@ -242,7 +265,7 @@ class HMP4040(Instrument):
 
     @serialized
     async def output(self, channel: int, enabled: bool) -> dict:
-        """Change only channel selection. The front-panel master remains operator-controlled."""
+        """Change only channel selection; this never writes the master switch."""
         if type(enabled) is not bool:
             raise ValueError("enabled must be true or false")
         if not self.config.expected_serial or channel not in self.config.channels:
@@ -260,3 +283,129 @@ class HMP4040(Instrument):
                 f"CH{channel} did not turn on and was deselected. "
                 "Check the front-panel master and channel state."
             )
+
+    def _master_ticket_path(self) -> Path:
+        if not self.config.allow_remote_master or not self.config.expected_serial:
+            raise ValueError("Remote master requires explicit project opt-in and expected_serial")
+        if self._lease is None or not self.is_connected:
+            raise InstrumentError("Master control requires a connected, leased instrument")
+        return self._lease.path.with_suffix(".master.json")
+
+    async def _master_plan(self, enabled: bool, channels: list[int]) -> dict:
+        if type(enabled) is not bool or not isinstance(channels, list):
+            raise ValueError("Specify a boolean master state and a list of channels")
+        if any(type(ch) is not int or ch not in range(1, 5) for ch in channels):
+            raise ValueError("Master channels must be integers from 1 through 4")
+        requested = sorted(channels)
+        if len(set(requested)) != len(requested) or (enabled and not requested):
+            raise ValueError("Specify unique channels and at least one channel for master on")
+        current = await self._output_state("OUTP:GEN?")
+        selected = []
+        settings = []
+        for ch in range(1, 5):
+            async with self._address_channel(ch):
+                if await self._output_state("OUTP:SEL?"):
+                    selected.append(ch)
+                if ch in requested:
+                    voltage, limit = await self._setpoints()
+                    if enabled:
+                        self._check_limits(ch, voltage, limit)
+                    settings.append({"channel": ch, "voltage_v": voltage, "current_limit_a": limit})
+        if set(selected) - set(requested) or ((current or not enabled) and selected != requested):
+            raise ValueError(f"Selected channels {selected} do not match requested {requested}")
+        return {
+            "serial": (await self.get_info()).serial,
+            "master_before": current,
+            "master_after": enabled,
+            "selected_before": selected,
+            "channels": settings,
+        }
+
+    @serialized
+    async def master_plan(self, enabled: bool, channels: list[int]) -> dict:
+        """Create one reviewable request per leased endpoint; a new plan supersedes the old."""
+        path = self._master_ticket_path()
+        plan = await self._master_plan(enabled, channels)
+        request = {
+            "plan": plan,
+            "confirmation": f"APPROVE MASTER {'ON' if enabled else 'OFF'} {secrets.token_hex(8)}",
+            "expires_at_unix": time.time() + 180,
+        }
+        temp = path.with_suffix(".tmp")
+        temp.write_text(json.dumps(request), encoding="utf-8")
+        temp.replace(path)
+        return request
+
+    @serialized
+    async def master_apply(
+        self, confirmation: str, *, approve: MasterApproval | None = None
+    ) -> dict:
+        """Apply the latest explicitly confirmed plan once, after live revalidation."""
+        path = self._master_ticket_path()
+        try:
+            request = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError as exc:
+            raise ValueError("No pending master plan; preview before applying") from exc
+        if not isinstance(confirmation, str) or confirmation != request["confirmation"]:
+            raise ValueError("Explicit confirmation matching this master plan is required")
+        path.unlink()
+        plan = request["plan"]
+        enabled = plan["master_after"]
+        channels = [row["channel"] for row in plan["channels"]]
+        if time.time() >= request["expires_at_unix"]:
+            raise ValueError("Master plan expired; preview again")
+        if approve is None:
+            raise ValueError("Master switching requires an interactive operator approval")
+        async with asyncio.timeout(max(0, request["expires_at_unix"] - time.time())):
+            if await approve(describe_master_plan(plan)) is not True:
+                raise ValueError("Operator did not approve master change")
+        if time.time() >= request["expires_at_unix"]:
+            raise ValueError("Master plan expired during approval; preview again")
+        if await self._master_plan(enabled, channels) != plan:
+            raise ValueError("Master plan changed; preview again")
+        staged = []
+        try:
+            if enabled and not plan["master_before"]:
+                for ch in channels:
+                    if ch not in plan["selected_before"]:
+                        async with self._address_channel(ch):
+                            staged.append(ch)
+                            await self._checked_write("OUTP:SEL 1")
+                            if not await self._output_state("OUTP:SEL?"):
+                                raise InstrumentError(f"Failed to select CH{ch}")
+                staged_plan = {**plan, "selected_before": channels}
+                if await self._master_plan(True, channels) != staged_plan:
+                    raise InstrumentError("Selection or setpoints changed before master enable")
+            if enabled != plan["master_before"]:
+                if enabled:
+                    await self._checked_write("OUTP:GEN 1")
+                else:
+                    # An old queued error must not prevent an approved shutoff.
+                    await self._write_and_wait("OUTP:GEN 0")
+            if await self._output_state("OUTP:GEN?") != enabled:
+                raise InstrumentError("Unexpected master readback")
+            rows = (await self.status())["channels"]
+            if any(r["output_state"] != (enabled and r["channel"] in channels) for r in rows):
+                raise InstrumentError("Unexpected channel output readback")
+            await self._check_error()
+            return {"plan": plan, "master_enabled": enabled, "channels": rows}
+        except BaseException as exc:
+            if not self.is_connected:
+                raise InstrumentError(
+                    "Master transaction interrupted; inspect physical outputs"
+                ) from exc
+            if enabled and not plan["master_before"]:
+                # Only roll back our attempt to energize a previously disabled master.
+                await self._write_and_wait("OUTP:GEN 0")
+                if await self._output_state("OUTP:GEN?"):
+                    raise InstrumentError(
+                        "Master rollback unverified; inspect physical outputs"
+                    ) from exc
+                for ch in staged:
+                    async with self._address_channel(ch):
+                        await self._write_and_wait("OUTP:SEL 0")
+                        if await self._output_state("OUTP:SEL?"):
+                            raise InstrumentError(
+                                f"CH{ch} remains selected; inspect supply"
+                            ) from exc
+            raise
