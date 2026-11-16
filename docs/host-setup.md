@@ -1,8 +1,7 @@
 # ScopeLoop Host Setup
 
-ScopeLoop should run directly on the machine that owns the hardware. For now
-that can be a macOS or Windows workstation. When the LattePanda Mu arrives, use
-it as a dedicated Linux instrument host.
+ScopeLoop should run directly on the machine that owns the hardware: a macOS or
+Windows workstation, or a dedicated Linux instrument host such as the LattePanda Mu.
 
 The hardware host runs ScopeLoop in a native Python virtualenv. USB access and
 vendor GUI apps stay on the host OS.
@@ -79,7 +78,9 @@ Check readiness:
 
 ## LattePanda Mu Dedicated Host
 
-When the Mu arrives, set it up as a single-purpose Linux host.
+For a new Mu, set it up as a dedicated instrument host. For an existing bench,
+use the [update procedure](#updating-an-existing-bench) instead of reinstalling
+its active environment.
 
 Recommended baseline:
 
@@ -93,20 +94,20 @@ Recommended baseline:
 Suggested layout:
 
 ```text
-/opt/scopeloop        repo checkout and venv
-/srv/scopeloop        capture artifacts on NVMe
-/etc/systemd/system   optional ScopeLoop service units
+/opt/scopeloop-control  initial source checkout and development venv
+/srv/scopeloop          releases and capture artifacts on NVMe
+/etc/systemd/system     optional ScopeLoop service units
 ```
 
 Initial install sketch:
 
 ```bash
 sudo apt update
-sudo apt install -y git python3-venv python3-pip
-sudo mkdir -p /opt/scopeloop /srv/scopeloop
-sudo chown -R "$USER:$USER" /opt/scopeloop /srv/scopeloop
-git clone <repo-url> /opt/scopeloop
-cd /opt/scopeloop
+sudo apt install -y git openssh-server python3-venv python3-pip
+sudo mkdir -p /opt/scopeloop-control /srv/scopeloop
+sudo chown "$USER:$USER" /opt/scopeloop-control /srv/scopeloop
+git clone <repo-url> /opt/scopeloop-control
+cd /opt/scopeloop-control
 python3 -m venv .venv
 .venv/bin/python -m pip install -e ".[dev,all-instruments]"
 .venv/bin/scopeloop host status --data-dir /srv/scopeloop
@@ -114,6 +115,57 @@ python3 -m venv .venv
 
 Install PicoScope 7 and Saleae Logic 2 on the host OS, then apply the Linux USB
 permissions they require. Keep the capture directory on the NVMe.
+
+### SSH access
+
+Check both the OpenSSH socket and service before diagnosing an inactive service
+as a failure; socket activation can accept connections while the service is idle:
+
+```bash
+systemctl status ssh.socket ssh.service
+ip -br addr
+```
+
+If a dedicated host should use a persistent listener instead, make the change
+from its local console during setup so a connection interruption is recoverable:
+
+```bash
+sudo systemctl disable --now ssh.socket
+sudo systemctl enable --now ssh.service
+systemctl status ssh.service
+```
+
+After moving the Ethernet cable between ports, check the current address and
+DHCP reservation rather than assuming the previous interface address still works.
+
+### USB audio capture
+
+When the operator needs direct ALSA capture access, install `alsa-utils` and
+grant access through the host's audio-device group policy. On hosts using the
+`audio` group, add the operator and start a new login session:
+
+```bash
+sudo usermod -aG audio "$USER"
+id
+arecord -l
+```
+
+Select the microphone by its ALSA card name from `arecord -l`, rather than a
+numeric index that can change with USB enumeration. Store that name, microphone
+identity and the verified mixer setting in private bench configuration. For a
+device supporting 48 kHz, 16-bit mono, an example capture is:
+
+```bash
+audio_card=YOUR_CARD_NAME
+amixer -c "$audio_card" scontents
+arecord -q -D "hw:CARD=$audio_card,DEV=0" \
+  -f S16_LE -r 48000 -c 1 -d 20 capture.wav
+```
+
+Record gain, sample format, microphone position, DUT configuration, load and
+ambient conditions with every capture. Confirm the actual mixer dB setting;
+numeric volume values are device-specific. Without an acoustic calibrator,
+report spectral tones and relative levels in dBFS, not calibrated dBA or SPL.
 
 ## Updating an existing bench
 
