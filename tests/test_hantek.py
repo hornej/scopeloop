@@ -255,6 +255,51 @@ async def test_failed_off_is_not_success(bench, tmp_path, fast):
     assert service.manager.get_lock_info(service.key) is None
 
 
+async def test_failed_off_does_not_carry_output_ownership_to_reconnect(bench):
+    replay, service = bench
+    replay.fail_write = lambda p: replay.awg[8] == 1 and p == packet(2, 8, 0)
+    with pytest.raises(USBError):
+        async with service.session() as d:
+            await d.awg_output(True)
+    assert replay.awg[8] == 1  # Failed cleanup cannot establish physical output state.
+    replay.fail_write = None
+    start = len(replay.tx)
+    result = await service.command("status", {})
+    assert result["awg"]["output_enabled_by_this_connection"] is False
+    assert all(p[3] == 1 for p in replay.tx[start:])
+
+
+async def test_waiting_command_transcript_excludes_other_owner(bench, tmp_path, monkeypatch):
+    replay, service = bench
+    waiting = asyncio.Event()
+    acquire = service.manager._acquire_lock
+
+    async def observed_acquire(resource_id, client_id, *args):
+        if client_id == "waiting":
+            waiting.set()
+        return await acquire(resource_id, client_id, *args)
+
+    monkeypatch.setattr(service.manager, "_acquire_lock", observed_acquire)
+    bundle = tmp_path / "waiting"
+    async with asyncio.timeout(10):
+        async with service.session("owner") as d:
+            task = asyncio.create_task(
+                service.command("dmm_read", {"output": bundle}, "waiting")
+            )
+            await waiting.wait()
+            await d.screen("scope")
+        await task
+    transcript = json.loads((bundle / "usb.json").read_text())
+    assert packet(3, 0, 0) in replay.tx
+    assert packet(3, 0, 0).hex() not in [entry["tx"] for entry in transcript]
+    assert [entry["tx"] for entry in transcript] == [
+        packet(3, 9, read=True).hex(),
+        packet(3, 1, read=True).hex(),
+        packet(3, 10, read=True).hex(),
+        "0005010100",
+    ]
+
+
 async def test_stale_reply_rejected(bench):
     replay, service = bench
     replay.override[packet(2, 1, read=True)] = bytes.fromhex("55070203e80300000000")
@@ -314,6 +359,25 @@ async def test_short_scope_read_restores_coupling_and_stops(bench, tmp_path, fas
     with pytest.raises(ProtocolError, match="Truncated"):
         await service.command("scope_capture", {"output": tmp_path / "failed"})
     assert replay.scope[1] == 1 and replay.scope[12] == 0
+    assert not replay.opened
+
+
+@pytest.mark.parametrize("index,value", [(12, 0), (15, 1), (17, 1), (18, 1), (19, 2), (20, 99)])
+async def test_capture_rejects_run_position_and_trigger_changes(bench, fast, index, value):
+    replay, service = bench
+    read = replay.read
+
+    def changed_read(size):
+        response = read(size)
+        if replay.frames == 2 and replay.tx[-1][0] == 94:
+            replay.scope[index] = value
+        return response
+
+    replay.read = changed_read
+    async with service.session() as d:
+        with pytest.raises(ProtocolError, match="setup changed"):
+            await d.scope_capture()
+    assert replay.scope[12] == 0
     assert not replay.opened
 
 

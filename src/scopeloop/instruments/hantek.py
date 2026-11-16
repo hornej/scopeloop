@@ -242,6 +242,9 @@ class Hantek2000:
                 await self._io(self.transport.close)
             finally:
                 self.connected = False
+                # A later connection cannot claim output ownership from this one,
+                # including when OFF failed and the physical state is unknown.
+                self._output_owned = False
                 self._lease.release()
 
     async def _write(self, data: bytes):
@@ -496,8 +499,8 @@ class Hantek2000:
         try:
             raw, discarded = await snapshot()
             after = await self.scope_status()
-            expected = {**before, "running": True, "trigger_mode": "auto"}
-            for key in ("channels", "seconds_per_div", "format_code"):
+            expected = {**before, "running": True}
+            for key in expected.keys() - {"raw_hex"}:
                 if after[key] != expected[key]:
                     raise ProtocolError("Scope setup changed during transfer")
             return {

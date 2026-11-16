@@ -44,7 +44,7 @@ class HantekService:
         return self.driver
 
     @asynccontextmanager
-    async def session(self, client_id="project"):
+    async def session(self, client_id="project", *, transcript: list[dict] | None = None):
         """Retain this context across the entire multi-instrument bench test."""
         if not self._registered:
             await self.manager.register(
@@ -52,18 +52,26 @@ class HantekService:
             )
             self._registered = True
         async with self.manager.lock(self.key, client_id):
-            connected = self.manager.get_resource_info(self.key).state == ResourceState.CONNECTED
-            driver = await self.manager.connect(self.key)
+            start = len(self.driver.transcript)
             try:
-                yield driver
+                resource = self.manager.get_resource_info(self.key)
+                connected = resource.state == ResourceState.CONNECTED
+                driver = await self.manager.connect(self.key)
+                try:
+                    yield driver
+                finally:
+                    if not connected:
+                        # ResourceManager logs disconnect errors. Propagate our own
+                        # cleanup failure so a failed output-off cannot report success.
+                        try:
+                            await driver.disconnect()
+                        finally:
+                            await self.manager.disconnect(self.key)
             finally:
-                if not connected:
-                    # ResourceManager logs disconnect errors. Propagate our own
-                    # cleanup failure so a failed output-off cannot report success.
-                    try:
-                        await driver.disconnect()
-                    finally:
-                        await self.manager.disconnect(self.key)
+                # Bound evidence under the same ownership as connect, I/O and cleanup.
+                # A queued command must not include the preceding owner's traffic.
+                if transcript is not None:
+                    transcript.extend(self.driver.transcript[start:])
 
     async def command(self, name, args, client_id="project"):
         args = dict(args)
@@ -86,9 +94,9 @@ class HantekService:
                 output / "sessions", project_name="Hantek bench", description=f"Hantek {name}"
             )
             await session.start()
-        start = len(self.driver.transcript)
+        transcript = []
         try:
-            async with self.session(client_id) as d:
+            async with self.session(client_id, transcript=transcript) as d:
                 manifest["instrument"] = d.identity
                 if name == "status":
                     result = {
@@ -133,7 +141,6 @@ class HantekService:
             raise
         finally:
             if output:
-                transcript = self.driver.transcript[start:]
                 (output / "usb.json").write_text(json.dumps(transcript, indent=2), encoding="utf-8")
                 if session:
                     for event in transcript:
