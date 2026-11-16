@@ -402,6 +402,24 @@ class RuntimeConfig(BaseModel):
     data_dir: str = "~/ScopeLoop"
 
 
+class ZeroPiHatConfig(BaseModel, extra="forbid"):
+    """Explicit fixture identity; no GPIO writes merely from loading a project."""
+
+    revision: Literal["0.1.0"]
+    gpiochip: str = "/dev/gpiochip0"
+    expected_pi_serial: str | None = Field(default=None, min_length=1)
+    socket_path: str = "~/.scopeloop/zero-pi-hat/control.sock"
+    loads: list[str] = Field(default_factory=list)
+    wiring_confirmed: bool = False
+
+    @field_validator("loads")
+    @classmethod
+    def nonempty_load_names(cls, values: list[str]) -> list[str]:
+        if any(not value.strip() for value in values):
+            raise ValueError("Each shared-output load needs a name")
+        return values
+
+
 class Config(BaseModel):
     """Root configuration for scopeloop.yaml."""
 
@@ -415,6 +433,7 @@ class Config(BaseModel):
     instruments: InstrumentsConfig = Field(default_factory=InstrumentsConfig)
     modules: dict[str, ExpansionModuleConfig] = Field(default_factory=dict)
     fixtures: dict[str, FixtureModuleConfig] = Field(default_factory=dict)
+    zero_pi_hat: ZeroPiHatConfig | None = None
     tests: list[TestConfig] = Field(default_factory=list)
     git: GitConfig = Field(default_factory=GitConfig)
     safety: SafetyConfig = Field(default_factory=SafetyConfig)

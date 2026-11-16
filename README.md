@@ -6,6 +6,7 @@ ScopeLoop enables AI coding assistants like Claude Code to autonomously develop 
 
 ## Bench workflows
 
+- [Zero Pi HAT v0.1.0 shared-output control](docs/zero-pi-hat.md)
 - [Hantek 2000 USB scope, DMM and generator](docs/hantek.md)
 - [HMP4040 LAN setup, channel control and DC telemetry](docs/power-supply.md)
 - [Scope ripple, noise floor and load-step evidence](docs/scope-capture.md)

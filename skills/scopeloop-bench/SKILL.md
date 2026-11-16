@@ -29,6 +29,10 @@ deployment switch. Staging and offline tests can proceed independently.
   specific DUT and channel. The master defaults to the front panel. In projects
   that opt in, use the master preview and operator-confirmed apply workflow.
   Show the exact affected rails and setpoints. A preview token alone is not approval.
+- For Zero Pi HAT control, read `docs/zero-pi-hat.md`. Inspect the revision,
+  Pi identity and all shared-output loads. Keep the persistent GPIO owner alive:
+  releasing this board's enable can turn power on. Never take over an existing
+  GPIO holder or infer measured rail voltage from an enable/fault pin.
 - For MAX31856 thermocouple capture or fault recovery, read docs/thermocouples.md.
   Preserve fault evidence, stop the DUT load on invalid data, and require an
   explicit idle acknowledgement before reinitializing. Recovery never re-arms a DUT.

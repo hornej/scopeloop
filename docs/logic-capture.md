@@ -159,6 +159,17 @@ capability query for enumerating all supported combinations, so ScopeLoop
 performs structural checks first and returns the complete rejected combination
 if Logic 2 refuses it.
 
+Timed analog-only recipes can use `digital_channels: []` and omit the digital
+sample rate. Supply an explicit analog rate; do not add a dummy digital probe
+to work around logging. Requested duration and exported sample span can differ;
+derive signal timing from exported timestamps and retain the requested setup.
+
+Sampling rate does not establish analog bandwidth. In the November 2026 PAL
+bench, 12.5 MS/s captures obscured color burst while 50 MS/s retained it. Record
+the instrument's bandwidth/filtering and load/probe conditions before judging
+high-frequency content or amplitude. Verify uncertain probe paths against a
+known DC reference, and record actual probe moves rather than reusing old labels.
+
 The official API labels protocol analyzers but has no native channel-label setter.
 By default the SAL remains untouched and `native_labels_applied` is false. For a
 verified native copy, use the [native labels workflow](#verified-native-labels).

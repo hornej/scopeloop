@@ -61,6 +61,7 @@ Thumbs.db
 *.log
 
 # Local development
+/tmp/
 .env
 .env.local
 names.md

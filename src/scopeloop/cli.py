@@ -22,6 +22,7 @@ from scopeloop.config import (
 )
 from scopeloop.devices import DeviceManager, DeviceMatch
 from scopeloop.hantek_cli import app as hantek_app
+from scopeloop.hat_cli import app as hat_app
 from scopeloop.host import collect_host_status, format_bytes
 from scopeloop.instruments.base import InstrumentError
 from scopeloop.logic import LogicCaptureService, parse_metadata
@@ -39,6 +40,7 @@ app = typer.Typer(
 
 console = Console()
 app.add_typer(power_app, name="power")
+app.add_typer(hat_app, name="hat")
 app.add_typer(hantek_app, name="hantek")
 app.add_typer(thermocouple_app, name="thermocouple")
 

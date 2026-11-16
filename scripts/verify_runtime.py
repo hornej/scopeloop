@@ -43,6 +43,9 @@ async def _discover(cwd):
                 "scopeloop_power_status",
                 "scopeloop_power_configure",
                 "scopeloop_power_output",
+                "scopeloop_hat_status",
+                "scopeloop_hat_output",
+                "scopeloop_hat_cycle",
                 "scopeloop_hantek_status",
                 "scopeloop_hantek_dmm_read",
                 "scopeloop_hantek_awg_run",
@@ -67,6 +70,7 @@ def main():
         ["logic", "--help"],
         ["power", "--help"],
         ["hantek", "--help"],
+        ["hat", "--help"],
     ):
         result = subprocess.run([str(cli), *args], capture_output=True, timeout=20)
         if result.returncode:
